@@ -347,11 +347,7 @@ export function HomeDashboard() {
     }
     const agErr = params.get("antigravity_error");
     if (agErr) {
-      const agErrText =
-        agErr === "oauth_not_configured"
-          ? "configuration OAuth manquante côté API (variables ANTIGRAVITY_OAUTH_* et ANTIGRAVITY_PROJECT_ID — voir README)."
-          : decodeURIComponent(agErr);
-      setError(`Antigravity OAuth : ${agErrText}`);
+      setError(`Antigravity OAuth : ${decodeURIComponent(agErr)}`);
       checkAntigravityAuth();
       window.history.replaceState({}, "", window.location.pathname);
     }

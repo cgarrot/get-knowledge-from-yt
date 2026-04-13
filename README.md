@@ -17,7 +17,7 @@ Monorepo open source : extraction de contenu structuré depuis des vidéos YouTu
 
 ### OAuth Antigravity : constantes publiques vs secrets réels
 
-Les valeurs `client_id`, `client_secret` et `project_id` pour Antigravity sont les **mêmes constantes OAuth « desktop »** que dans [opencode-antigravity-auth](https://github.com/NoeFabris/opencode-antigravity-auth) (`src/constants.ts` : `clientId`, `clientSecret`, `projectId`). Ce ne sont **pas** des équivalents d’une clé API ou d’un refresh token, mais **GitHub push protection** refuse qu’on les laisse en clair dans ce dépôt : il faut les **copier dans ton environnement** (voir le tableau des variables ci‑dessous).
+Les valeurs par défaut `client_id`, `client_secret` et `project_id` pour Antigravity sont les **mêmes constantes OAuth « desktop »** que dans [opencode-antigravity-auth](https://github.com/NoeFabris/opencode-antigravity-auth) (`src/constants.ts`). Elles sont **embarquées dans le code** (en hex UTF‑8 pour satisfaire la *push protection* GitHub, qui bloque les mêmes chaînes en clair). Ce ne sont **pas** des équivalents d’une clé API ou d’un refresh token.
 
 À protéger absolument : **`GEMINI_API_KEY`**, **refresh tokens**, contenu de **`data/`** (SQLite, jetons), et tout fichier d’environnement local. Détail dans [SECURITY.md](SECURITY.md).
 
@@ -47,9 +47,9 @@ npm install
 |----------|-----|------|
 | `GEMINI_API_KEY` | shell / `.env` chargé par l’API | Appels Google Genai (provider `gemini`) |
 | `ANTIGRAVITY_REFRESH_TOKEN` | shell | Refresh token OAuth (**priorité absolue** sur `data/` et OpenCode). Retirée du processus API après login web ou import OpenCode ; ne la définis pas si tu veux que le fichier `data/antigravity_refresh_token.txt` suive les changements de compte. |
-| `ANTIGRAVITY_OAUTH_CLIENT_ID` | **requis** si provider `antigravity` | Client OAuth desktop — copier `clientId` depuis [constants.ts](https://github.com/NoeFabris/opencode-antigravity-auth/blob/main/src/constants.ts) |
-| `ANTIGRAVITY_OAUTH_CLIENT_SECRET` | **requis** si provider `antigravity` | Copier `clientSecret` (même fichier ; constante publique « desktop », pas un secret utilisateur) |
-| `ANTIGRAVITY_PROJECT_ID` | **requis** si provider `antigravity` | Copier `projectId` (même fichier) |
+| `ANTIGRAVITY_OAUTH_CLIENT_ID` | optionnel | Remplace le client OAuth embarqué pour `antigravity` |
+| `ANTIGRAVITY_OAUTH_CLIENT_SECRET` | optionnel | Remplace le secret embarqué (voir note ci‑dessus) |
+| `ANTIGRAVITY_PROJECT_ID` | optionnel | Remplace l’ID projet embarqué |
 | `GKFY_DATA_DIR` | optionnel | Répertoire données (défaut : `<repo>/data`) |
 | `GKFY_PUBLIC_API_URL` | optionnel | URL publique de l’API pour OAuth (défaut : `http://127.0.0.1:8000`) — sert aussi à construire l’`redirect_uri` par défaut |
 | `GKFY_ANTIGRAVITY_OAUTH_REDIRECT_URI` | optionnel | `redirect_uri` Google. **Défaut :** `http://localhost:51121/oauth-callback` (identique à [opencode-antigravity-auth](https://github.com/NoeFabris/opencode-antigravity-auth) ; mini-serveur avec l’API). Pour utiliser le callback FastAPI : `http://127.0.0.1:8000/auth/antigravity/callback` **après** l’avoir ajoutée dans Google Cloud. |

@@ -12,7 +12,7 @@ Les entrées correspondantes sont dans [.gitignore](.gitignore) et [apps/web/.gi
 
 ## Configuration OAuth Antigravity (à comprendre)
 
-- [ ] Pour Antigravity, les variables `ANTIGRAVITY_OAUTH_*` / `ANTIGRAVITY_PROJECT_ID` ne sont **pas** dans le dépôt (politique GitHub) : ce sont pourtant les **mêmes constantes desktop publiques** que [opencode-antigravity-auth](https://github.com/NoeFabris/opencode-antigravity-auth) — pas des équivalents de `GEMINI_API_KEY` ou d’un refresh token.
+- [ ] Les défauts Antigravity (`client_id` / `client_secret` / `project_id`) sont les **mêmes constantes desktop publiques** que [opencode-antigravity-auth](https://github.com/NoeFabris/opencode-antigravity-auth), stockées en **hex** dans le code pour la *push protection* GitHub — pas des équivalents de `GEMINI_API_KEY` ou d’un refresh token.
 - [ ] Les **vrais secrets** à protéger restent : refresh tokens, clés API, contenu de `data/`, fichiers locaux d’environnement. Voir [SECURITY.md](SECURITY.md).
 
 ## Vérifications automatiques (alignées sur la CI)

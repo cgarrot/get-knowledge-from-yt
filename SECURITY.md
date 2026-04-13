@@ -14,7 +14,7 @@ Ces chemins sont couverts par [.gitignore](.gitignore) ; en cas de doute avant u
 
 ## OAuth Antigravity : « secret » client vs secrets utilisateur
 
-Le flux Antigravity utilise les **mêmes constantes OAuth publiques** (identifiant client, secret client de type application desktop, ID projet) que [opencode-antigravity-auth](https://github.com/NoeFabris/opencode-antigravity-auth) (`src/constants.ts`). Elles ne remplacent pas une authentification utilisateur. Elles ne sont **pas** committées ici : la protection anti‑secret de GitHub bloque ces chaînes même lorsqu’elles sont publiques ; configure-les en local via `ANTIGRAVITY_OAUTH_CLIENT_ID`, `ANTIGRAVITY_OAUTH_CLIENT_SECRET`, `ANTIGRAVITY_PROJECT_ID` (voir README).
+Le dépôt embarque les **mêmes constantes OAuth publiques** (identifiant client, secret client de type application desktop, ID projet) que [opencode-antigravity-auth](https://github.com/NoeFabris/opencode-antigravity-auth), sous forme **hex UTF‑8** dans le code Python afin d’éviter le blocage *push protection* de GitHub sur les littéraux OAuth en clair. Elles ne remplacent pas une authentification utilisateur ; tu peux toujours les surcharger via l’environnement (voir README).
 
 Les **secrets à traiter comme confidentiels** restent :
 

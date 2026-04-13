@@ -296,18 +296,12 @@ def antigravity_import_opencode(
 @router.get("/login")
 def antigravity_login() -> RedirectResponse:
     _purge_stale_oauth_states()
-    try:
-        client_id, _, _ = _oauth_config()
-    except RuntimeError as exc:
-        logger.warning("Antigravity OAuth login: %s", exc)
-        return RedirectResponse(
-            f"{FRONTEND_BASE}/?antigravity_error=oauth_not_configured",
-            status_code=302,
-        )
     state = secrets.token_urlsafe(32)
     verifier = _pkce_verifier()
     challenge = _pkce_challenge(verifier)
     _store_oauth_state(state, verifier)
+
+    client_id, _, _ = _oauth_config()
     redirect_uri = ANTIGRAVITY_OAUTH_REDIRECT_URI
     params = {
         "client_id": client_id,
@@ -344,11 +338,7 @@ def _oauth_callback_location(
         logger.warning("Antigravity OAuth callback: invalid or expired state")
         return f"{FRONTEND_BASE}/?antigravity_error=invalid_state"
 
-    try:
-        client_id, client_secret, _ = _oauth_config()
-    except RuntimeError as exc:
-        logger.warning("Antigravity OAuth callback: %s", exc)
-        return f"{FRONTEND_BASE}/?antigravity_error=oauth_not_configured"
+    client_id, client_secret, _ = _oauth_config()
     redirect_uri = ANTIGRAVITY_OAUTH_REDIRECT_URI
     resp = requests.post(
         "https://oauth2.googleapis.com/token",

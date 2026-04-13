@@ -11,6 +11,7 @@ import { useGkfyRealtime } from "@/lib/useGkfyRealtime";
 import type { Job, JobStatus } from "@/types/job";
 import { StatusBadge } from "@/components/StatusBadge";
 import { CancelPendingJobButton } from "@/components/CancelPendingJobButton";
+import { RetryFailedJobButton } from "@/components/RetryFailedJobButton";
 
 const STATUSES: (JobStatus | "")[] = [
   "",
@@ -175,6 +176,12 @@ export default function HistoryPage() {
                           jobId={j.id}
                           onSuccess={() => void load()}
                           label="Retirer de la file"
+                        />
+                      ) : null}
+                      {j.status === "error" ? (
+                        <RetryFailedJobButton
+                          jobId={j.id}
+                          onSuccess={() => void load()}
                         />
                       ) : null}
                     </div>

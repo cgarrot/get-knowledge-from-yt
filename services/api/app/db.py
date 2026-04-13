@@ -418,6 +418,35 @@ def cancel_pending_job(job_id: str) -> bool:
     return ok
 
 
+def requeue_failed_job(job_id: str) -> bool:
+    """Reset a job in *error* to *pending* and clear stale fields. Returns True if a row was updated."""
+    now = _utc_now()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            UPDATE jobs
+            SET status = 'pending',
+                error_message = NULL,
+                log_message = NULL,
+                output_rel_path = NULL,
+                analysis_markdown = NULL,
+                updated_at = ?
+            WHERE id = ? AND status = 'error'
+            """,
+            (now, job_id),
+        )
+        conn.commit()
+        ok = cur.rowcount > 0
+    if ok:
+        try:
+            from . import realtime
+
+            realtime.emit_job_updated(job_id)
+        except Exception:  # noqa: BLE001
+            pass
+    return ok
+
+
 def update_job(
     job_id: str,
     *,

@@ -48,6 +48,7 @@ from .db import (
     fetch_prompts_catalog,
     get_analysis_markdown_by_rel,
     cancel_pending_job,
+    requeue_failed_job,
     get_job,
     get_latest_job_by_output_rel,
     init_db,
@@ -456,6 +457,24 @@ def cancel_job(job_id: str) -> dict[str, Any]:
     raise HTTPException(
         status_code=409,
         detail=f"Job cannot be cancelled (status: {row.status})",
+    )
+
+
+@app.post("/jobs/{job_id}/retry")
+def retry_job(job_id: str) -> dict[str, Any]:
+    """Put a failed (*error*) job back in the worker queue with the same parameters."""
+    if requeue_failed_job(job_id):
+        pool.enqueue(job_id)
+        row = get_job(job_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return row.to_dict()
+    row = get_job(job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    raise HTTPException(
+        status_code=409,
+        detail=f"Job cannot be retried (status: {row.status})",
     )
 
 

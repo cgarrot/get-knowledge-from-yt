@@ -20,6 +20,7 @@ import {
 import { upsertRecentJobs } from "@/lib/jobsLive";
 import { useGkfyRealtime } from "@/lib/useGkfyRealtime";
 import { CancelPendingJobButton } from "@/components/CancelPendingJobButton";
+import { RetryFailedJobButton } from "@/components/RetryFailedJobButton";
 import { StatusBadge } from "@/components/StatusBadge";
 
 interface StreamPayload {
@@ -1135,6 +1136,12 @@ export function HomeDashboard() {
                           jobId={j.id}
                           onSuccess={refresh}
                           label="Annuler"
+                        />
+                      ) : null}
+                      {j.status === "error" ? (
+                        <RetryFailedJobButton
+                          jobId={j.id}
+                          onSuccess={refresh}
                         />
                       ) : null}
                     </div>

@@ -8,6 +8,7 @@ import { MarkdownBody } from "@/components/MarkdownBody";
 import { stripFrontmatter } from "@/lib/markdown";
 import type { Job } from "@/types/job";
 import { CancelPendingJobButton } from "@/components/CancelPendingJobButton";
+import { RetryFailedJobButton } from "@/components/RetryFailedJobButton";
 import { StatusBadge } from "@/components/StatusBadge";
 import { JobDetailClient } from "./ui";
 import type { GkfyRealtimeMessage } from "@/types/realtime";
@@ -71,6 +72,12 @@ export function JobPageClient({ initialJob }: { initialJob: Job }) {
           <StatusBadge status={job.status} />
           {job.status === "pending" ? (
             <CancelPendingJobButton
+              jobId={job.id}
+              onSuccess={() => void resyncFromApi()}
+            />
+          ) : null}
+          {job.status === "error" ? (
+            <RetryFailedJobButton
               jobId={job.id}
               onSuccess={() => void resyncFromApi()}
             />

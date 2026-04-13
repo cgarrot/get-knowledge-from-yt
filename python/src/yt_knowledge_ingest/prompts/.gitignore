@@ -1,0 +1,4 @@
+# Fichiers prompt Markdown locaux / privés (non versionnés).
+# Les noms « default » et « game-theory » restent disponibles via le code
+# (voir yt_knowledge_ingest.prompts et game_theory_builtin.py).
+*.md

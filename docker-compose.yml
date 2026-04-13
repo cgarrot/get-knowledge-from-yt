@@ -34,6 +34,9 @@ services:
       dockerfile: apps/web/Dockerfile
       args:
         NEXT_PUBLIC_API_URL: http://127.0.0.1:8000
+    environment:
+      # SSR dans le conteneur : joindre le service Compose (127.0.0.1:8000 = le conteneur web lui-même)
+      INTERNAL_API_URL: http://api:8000
     ports:
       - "3030:3030"
     depends_on:

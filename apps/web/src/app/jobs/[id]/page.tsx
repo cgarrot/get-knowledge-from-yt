@@ -1,11 +1,11 @@
 import Link from "next/link";
-import { getApiBase } from "@/lib/api";
+import { getApiBase, getServerApiBase } from "@/lib/api";
 import type { Job } from "@/types/job";
 import { StatusBadge } from "@/components/StatusBadge";
 import { JobDetailClient } from "./ui";
 
 async function fetchJob(id: string): Promise<Job | null> {
-  const base = getApiBase();
+  const base = getServerApiBase();
   const res = await fetch(`${base}/jobs/${id}`, { cache: "no-store" });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error(await res.text());

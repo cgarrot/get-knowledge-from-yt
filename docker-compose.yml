@@ -14,8 +14,8 @@ services:
       context: .
       dockerfile: services/api/Dockerfile
     ports:
-      - "8000:8000"
-      - "51121:51121"
+      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:51121:51121"
     env_file:
       - path: .env
         required: false
@@ -38,7 +38,7 @@ services:
       # SSR dans le conteneur : joindre le service Compose (127.0.0.1:8000 = le conteneur web lui-même)
       INTERNAL_API_URL: http://api:8000
     ports:
-      - "3030:3030"
+      - "127.0.0.1:3030:3030"
     depends_on:
       - api
 

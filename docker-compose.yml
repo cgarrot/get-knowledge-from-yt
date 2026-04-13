@@ -1,0 +1,43 @@
+# get-knowledge-from-yt — API FastAPI + Next.js
+#
+# Prérequis secrets : créer un fichier `.env` à la racine du dépôt (non versionné)
+# avec au minimum GEMINI_API_KEY et/ou les variables Antigravity (voir README).
+#
+# Démarrage : docker compose up --build
+# Front : http://localhost:3030  |  API : http://127.0.0.1:8000  |  health : /health
+#
+# OAuth Antigravity (redirect loopback) : le port 51121 est exposé sur l’hôte.
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    ports:
+      - "8000:8000"
+      - "51121:51121"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      GKFY_DATA_DIR: /data
+      GKFY_PUBLIC_API_URL: http://127.0.0.1:8000
+      GKFY_FRONTEND_URL: http://localhost:3030
+      # Redirect OAuth (51121) joignable depuis l’hôte via le publish Docker
+      GKFY_ANTIGRAVITY_OAUTH_LOOPBACK_BIND: "0.0.0.0"
+    volumes:
+      - gkfy-data:/data
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: http://127.0.0.1:8000
+    ports:
+      - "3030:3030"
+    depends_on:
+      - api
+
+volumes:
+  gkfy-data:

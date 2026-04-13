@@ -1,0 +1,29 @@
+# Git / meta
+.git
+.github
+
+# Local runtime (mounted or empty in containers)
+data/
+
+# Python
+.venv
+venv
+**/.pytest_cache
+**/__pycache__
+**/*.egg-info
+**/.coverage
+**/htmlcov
+
+# Node
+**/node_modules
+**/.next
+
+# Env files (pass via compose env_file or secrets)
+.env
+.env.*
+!.env.example
+apps/web/.env.local
+
+# IDE / OS
+.DS_Store
+*.log

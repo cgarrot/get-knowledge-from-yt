@@ -1,15 +1,22 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { getApiBase } from "@/lib/api";
+import {
+  JOB_ACTIVITY_TRUNC,
+  recentJobUrlSummary,
+} from "@/lib/jobTableDisplay";
+import { useGkfyRealtime } from "@/lib/useGkfyRealtime";
 import type { Job, JobStatus } from "@/types/job";
 import { StatusBadge } from "@/components/StatusBadge";
+import { CancelPendingJobButton } from "@/components/CancelPendingJobButton";
 
 const STATUSES: (JobStatus | "")[] = [
   "",
   "pending",
   "processing",
+  "cancelled",
   "ok",
   "error",
   "skipped",
@@ -40,6 +47,27 @@ export default function HistoryPage() {
   useEffect(() => {
     load();
   }, [load]);
+
+  const loadRef = useRef(load);
+  loadRef.current = load;
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useGkfyRealtime(
+    useCallback((msg) => {
+      if (
+        msg.type === "job_created" ||
+        msg.type === "job_updated" ||
+        msg.type === "job_cancelled"
+      ) {
+        if (debounceRef.current) clearTimeout(debounceRef.current);
+        debounceRef.current = setTimeout(() => {
+          debounceRef.current = null;
+          void loadRef.current();
+        }, 250);
+      }
+    }, []),
+    { onOpen: () => void loadRef.current() },
+  );
 
   const sorted = useMemo(
     () => [...jobs].sort((a, b) => b.created_at.localeCompare(a.created_at)),
@@ -94,6 +122,7 @@ export default function HistoryPage() {
                 <th className="p-3 font-medium">Créé</th>
                 <th className="p-3 font-medium">Statut</th>
                 <th className="p-3 font-medium">URL</th>
+                <th className="p-3 font-medium max-w-[240px]">Activité</th>
                 <th className="p-3 font-medium">Collection</th>
                 <th className="p-3 font-medium">Prompt</th>
                 <th className="p-3 font-medium"></th>
@@ -111,18 +140,44 @@ export default function HistoryPage() {
                   <td className="p-3">
                     <StatusBadge status={j.status} />
                   </td>
-                  <td className="p-3 max-w-[220px] truncate font-mono text-xs">
-                    {j.url}
+                  <td
+                    className="p-3 max-w-[220px] truncate font-mono text-xs"
+                    title={recentJobUrlSummary(j)}
+                  >
+                    {recentJobUrlSummary(j)}
+                  </td>
+                  <td
+                    className="p-3 max-w-[240px] font-mono text-xs text-foreground/80"
+                    title={j.log_message ?? undefined}
+                  >
+                    {j.log_message ? (
+                      <span className="line-clamp-2 break-words">
+                        {j.log_message.length > JOB_ACTIVITY_TRUNC
+                          ? `${j.log_message.slice(0, JOB_ACTIVITY_TRUNC - 1)}…`
+                          : j.log_message}
+                      </span>
+                    ) : (
+                      "—"
+                    )}
                   </td>
                   <td className="p-3">{j.playlist_label}</td>
                   <td className="p-3">{j.prompt_name}</td>
                   <td className="p-3 whitespace-nowrap">
-                    <Link
-                      href={`/jobs/${j.id}`}
-                      className="text-sky-600 dark:text-sky-400 hover:underline"
-                    >
-                      Détail
-                    </Link>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Link
+                        href={`/jobs/${j.id}`}
+                        className="text-sky-600 dark:text-sky-400 hover:underline"
+                      >
+                        Détail
+                      </Link>
+                      {j.status === "pending" ? (
+                        <CancelPendingJobButton
+                          jobId={j.id}
+                          onSuccess={() => void load()}
+                          label="Retirer de la file"
+                        />
+                      ) : null}
+                    </div>
                   </td>
                 </tr>
               ))}

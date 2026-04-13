@@ -9,28 +9,38 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
+from yt_knowledge_ingest.auto_ingest_prompt import allocate_prompt_name
 from yt_knowledge_ingest.collection_classifier import classify_collection_folder
-from yt_knowledge_ingest.gemini_client import DEFAULT_MODEL, make_client
+from yt_knowledge_ingest.gemini_client import DEFAULT_MODEL, THINKING_LEVELS, make_client
 from yt_knowledge_ingest.ingest import process_video_job
 from yt_knowledge_ingest.paths import playlist_dir_for_source, resolve_slug
+from yt_knowledge_ingest.prompt_generator import generate_prompt_markdown
 from yt_knowledge_ingest.prompts import load_prompt, split_prompt_markdown
 
 from .config import (
     DEFAULT_WORKER_CONCURRENCY,
     OUTPUT_DIR,
     REPO_EXPORT_DIR,
+    REPO_ROOT,
     USER_PROMPTS_DIR,
     WRITE_OUTPUT_FILES,
 )
 from .db import (
+    JobRow,
+    fetch_prompts_catalog,
     get_job,
     kv_get,
     list_classifier_folder_hints,
     list_pending_job_ids,
+    sync_prompts_catalog,
     update_job,
     user_prompt_get,
+    user_prompt_upsert,
 )
+
+BUILTIN_PROMPTS_DIR = REPO_ROOT / "python" / "src" / "yt_knowledge_ingest" / "prompts"
 from .repo_export import mirror_markdown
+from . import realtime
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -108,12 +118,150 @@ def resolve_provider_client(provider: str):
     return _resolve_client(provider)
 
 
+def _prompt_generate_progress_log(
+    video_type: str, video_urls: list[str], *, max_type: int = 120, max_url: int = 80
+) -> str:
+    vt = video_type.strip()
+    if len(vt) > max_type:
+        vt = vt[: max_type - 1] + "…"
+    n = len(video_urls)
+    if n == 0:
+        return f"generating prompt for: {vt} (no ref URLs)"
+    first = (video_urls[0] or "").strip()
+    if len(first) > max_url:
+        first = first[: max_url - 1] + "…"
+    if n == 1:
+        return f"generating prompt for: {vt} | ref: {first}"
+    return f"generating prompt for: {vt} | {n} ref URLs; first: {first}"
+
+
+def _process_prompt_generate_job(job_id: str, row: JobRow) -> None:
+    if not row.payload_json:
+        update_job(
+            job_id,
+            status="error",
+            error_message="Missing payload",
+            log_message="no payload",
+        )
+        return
+    try:
+        payload = json.loads(row.payload_json)
+    except json.JSONDecodeError as exc:
+        update_job(
+            job_id,
+            status="error",
+            error_message=str(exc),
+            log_message="invalid payload json",
+        )
+        return
+
+    video_type = (payload.get("video_type") or "").strip()
+    if not video_type:
+        update_job(
+            job_id,
+            status="error",
+            error_message="video_type required",
+            log_message="invalid payload",
+        )
+        return
+    extra_notes = str(payload.get("extra_notes") or "")
+    raw_urls = payload.get("video_urls") or []
+    video_urls: list[str] = (
+        [str(u) for u in raw_urls] if isinstance(raw_urls, list) else []
+    )
+    raw_save = payload.get("save_to_name")
+    save_to_name: Optional[str] = None
+    if isinstance(raw_save, str) and raw_save.strip():
+        save_to_name = raw_save.strip()
+        if "/" in save_to_name or ".." in save_to_name:
+            update_job(
+                job_id,
+                status="error",
+                error_message="Invalid save_to_name",
+                log_message="invalid save_to_name",
+            )
+            return
+
+    tl = row.thinking_level
+    if tl not in THINKING_LEVELS:
+        tl = "medium"
+    client = _resolve_client(row.provider)
+    model = row.model or DEFAULT_MODEL
+    update_job(
+        job_id,
+        log_message=_prompt_generate_progress_log(video_type, video_urls),
+    )
+    try:
+        content = generate_prompt_markdown(
+            client=client,
+            provider=row.provider,
+            model=model,
+            video_type=video_type,
+            thinking_level=tl,
+            extra_notes=extra_notes,
+            video_urls=video_urls,
+        )
+    except ValueError as exc:
+        update_job(
+            job_id,
+            status="error",
+            error_message=str(exc),
+            log_message=str(exc),
+        )
+        return
+    except BaseException as exc:  # noqa: BLE001
+        logger.exception("Prompt job %s failed", job_id)
+        update_job(
+            job_id,
+            status="error",
+            error_message=f"{type(exc).__name__}: {exc}",
+            log_message=str(exc),
+        )
+        return
+
+    sync_prompts_catalog(BUILTIN_PROMPTS_DIR, USER_PROMPTS_DIR)
+    existing = {n for n, _ in fetch_prompts_catalog()}
+    if save_to_name:
+        name = save_to_name
+    else:
+        name = allocate_prompt_name(video_type, existing)
+    user_prompt_upsert(name, content)
+    sync_prompts_catalog(BUILTIN_PROMPTS_DIR, USER_PROMPTS_DIR)
+    try:
+        realtime.emit_prompt_saved(name, "user")
+    except Exception:  # noqa: BLE001
+        pass
+    rel = f"prompts/{name}.md"
+    if REPO_EXPORT_DIR is not None:
+        try:
+            mirror_markdown(REPO_EXPORT_DIR, rel, content)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Repo mirror failed for prompt %s: %s", name, exc)
+    n_urls = len(video_urls)
+    done_msg = (
+        f"saved prompt {name} ({n_urls} ref URL(s))"
+        if n_urls
+        else f"saved prompt {name}"
+    )
+    update_job(
+        job_id,
+        status="ok",
+        output_rel_path=rel,
+        log_message=done_msg,
+        analysis_markdown=content,
+    )
+
+
 def process_one_job(job_id: str) -> None:
     row = get_job(job_id)
     if row is None or row.status != "pending":
         return
 
     update_job(job_id, status="processing", log_message="started")
+
+    if row.job_kind == "prompt_generate":
+        _process_prompt_generate_job(job_id, row)
+        return
 
     try:
         system_instruction, user_turn = load_prompt_for_name(row.prompt_name)

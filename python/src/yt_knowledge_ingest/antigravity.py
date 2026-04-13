@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -19,6 +20,23 @@ import requests
 from .model_options import DEFAULT_ANTIGRAVITY_MODEL
 
 logger = logging.getLogger(__name__)
+
+# Process-wide limit on concurrent ``v1internal:generateContent`` HTTP calls. Shared by ingest
+# workers, prompt generation, collection classifier, etc. so a synchronous prompt-gen request
+# cannot stack on top of in-flight video jobs and exceed provider limits (often ~2).
+def _max_concurrent_antigravity_requests() -> int:
+    raw = (os.environ.get("ANTIGRAVITY_MAX_CONCURRENT_REQUESTS") or "").strip()
+    if not raw:
+        return 2
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 2
+
+
+_antigravity_generate_sem = threading.BoundedSemaphore(
+    _max_concurrent_antigravity_requests()
+)
 
 # OAuth client + project for Antigravity / cloudcode-pa token exchange, aligned with OpenCode /
 # opencode-antigravity-auth (same public desktop OAuth constants as their constants.ts).
@@ -418,7 +436,8 @@ class AntigravityClient:
 
             for endpoint in _ENDPOINTS:
                 try:
-                    result = self._call_endpoint(endpoint, body, headers)
+                    with _antigravity_generate_sem:
+                        result = self._call_endpoint(endpoint, body, headers)
                     return _extract_text(result)
                 except requests.RequestException as exc:
                     logger.warning("Antigravity endpoint %s failed: %s", endpoint, exc)

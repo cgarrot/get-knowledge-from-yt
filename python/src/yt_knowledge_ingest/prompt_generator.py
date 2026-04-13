@@ -54,6 +54,8 @@ summaries, and stylistic fluff.
 
 The downstream prompt must be strong enough to produce the final wiki
 document directly, not notes about how to write one.
+Make the final wiki concise only in its TL;DR and otherwise optimize for
+coverage, detail preservation, and reference value.
 
 ## ADAPT TO THE REQUESTED VIDEO TYPE
 
@@ -97,10 +99,29 @@ Design the downstream system instruction so that the downstream model:
 - remains reusable for future videos of the same type instead of overfitting
   to a single creator, franchise, or episode unless explicitly requested
 
+## DETAIL DENSITY & COVERAGE
+
+Design the downstream system instruction so that the downstream model:
+- preserves information density: if the source gives specific names, terms,
+  metrics, examples, steps, settings, constraints, or contrasts, keep them
+  instead of collapsing them into generic prose
+- captures more than the headline takeaway; cover the major segments,
+  demonstrations, arguments, decisions, and examples that materially add
+  knowledge
+- records multiple concrete examples when the video presents several, rather
+  than selecting only one representative example
+- uses bullets or short subsections when needed to retain dense material
+  cleanly instead of compressing everything into one short paragraph
+- is concise only in the TL;DR; the main body should optimize for completeness
+  and auditability, not brevity
+- avoids vague compression such as "various examples", "several tools", or
+  "the speaker discusses X" when the specific items can be named from evidence
+
 ## OUTPUT STRUCTURE
 
 Require the downstream output to be structured wiki markdown with a
-consistent, audit-friendly heading hierarchy.
+consistent, audit-friendly heading hierarchy. The structure should help
+preserve detail, not force over-compression.
 
 The generated prompt should require these core sections or close
 equivalents:
@@ -109,6 +130,10 @@ equivalents:
 - Key ideas, findings, or thesis
 - Evidence, examples, or case material
 - Uncertainty / evidence gaps
+
+Encourage bullets or short subsections inside evidence-heavy sections so the
+downstream model can capture multiple examples, cases, or segments without
+becoming vague.
 
 The generated prompt may require these optional sections only when relevant
 to the video type and supported by evidence:
@@ -132,12 +157,16 @@ Hard requirements for the generated SYSTEM instruction:
   modalities that are absent.
 - Do not fabricate visuals, quotes, charts, code, metrics, or timelines.
 - Avoid boilerplate openings and conclusions.
-- Keep the prompt compact, specific, and reusable for future videos of the
-  same type.
+- Keep the prompt compact and specific, but make the required downstream
+  output richly detailed whenever the source supports it.
 - Make it obvious that the downstream model must produce the final wiki
   document directly.
 - Make the downstream model favor omission and explicit uncertainty over
   confident invention.
+- Do not tell the downstream model to be generally concise except for the
+  TL;DR.
+- Do not reward polished abstraction if it discards concrete, source-backed
+  detail.
 
 ## REFERENCE SKELETON
 
@@ -163,10 +192,14 @@ Output the final wiki document directly in this structure:
 
 ## Key Ideas / Findings
 Explain the core concepts, arguments, decisions, or takeaways.
+Prefer several concrete subpoints over one generalized summary paragraph.
 
 ## Evidence & Examples
-List the strongest concrete evidence from the video. Include exact names,
-numbers, labels, steps, or quotes only when clearly visible or stated.
+List the strongest concrete evidence from the video. Prefer grouped bullets or
+short subsections when that preserves more detail. Include exact names,
+numbers, labels, steps, commands, settings, contrasts, or quotes only when
+clearly visible or stated. If the video provides several examples, keep
+several examples instead of collapsing them into one generic claim.
 
 ## [Optional genre-specific section]
 Include only if the source supports it: mechanisms, implementation rules,

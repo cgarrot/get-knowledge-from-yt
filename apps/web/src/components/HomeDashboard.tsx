@@ -12,6 +12,14 @@ import {
   writeLlmFormPrefs,
 } from "@/lib/llmFormPrefs";
 import type { Job } from "@/types/job";
+import type { GkfyRealtimeMessage } from "@/types/realtime";
+import {
+  JOB_ACTIVITY_TRUNC,
+  recentJobUrlSummary,
+} from "@/lib/jobTableDisplay";
+import { upsertRecentJobs } from "@/lib/jobsLive";
+import { useGkfyRealtime } from "@/lib/useGkfyRealtime";
+import { CancelPendingJobButton } from "@/components/CancelPendingJobButton";
 import { StatusBadge } from "@/components/StatusBadge";
 
 interface StreamPayload {
@@ -39,6 +47,24 @@ const HOME_LLM_DEFAULTS = {
   thinking_level: "minimal",
 };
 
+/** Sentinelle UI : non présente dans le catalogue API ; active `auto_generate_prompt`. */
+const AUTO_PROMPT_SENTINEL = "__gkfy_auto_prompt__";
+
+const ctrl =
+  "w-full rounded-lg border border-black/10 dark:border-white/10 bg-background px-3 py-2.5 text-sm transition-[box-shadow,border-color] focus:outline-none focus:ring-2 focus:ring-sky-500/20 dark:focus:ring-sky-400/25 focus:border-sky-500/40 dark:focus:border-sky-400/45";
+
+const ctrlMono = `${ctrl} font-mono text-[13px] leading-normal`;
+
+const lbl = "text-sm font-medium text-foreground/85";
+
+const hint = "text-xs text-foreground/50 mt-1.5 leading-relaxed";
+
+const panel =
+  "rounded-xl border border-black/10 dark:border-white/10 bg-black/[0.02] dark:bg-white/[0.03]";
+
+/** Cap merged rows until full refresh; aligns with dashboard pending + recent slice. */
+const LIVE_MERGE_MAX = 520;
+
 export function HomeDashboard() {
   const [urls, setUrls] = useState("");
   const [playlistLabel, setPlaylistLabel] = useState("default");
@@ -65,10 +91,15 @@ export function HomeDashboard() {
   );
   const [prompt, setPrompt] = useState("default");
   const [promptOptions, setPromptOptions] = useState<PromptOption[]>([]);
+  const [promptReferenceCount, setPromptReferenceCount] = useState<2 | 3>(3);
+  const [promptGenThinking, setPromptGenThinking] = useState<
+    "minimal" | "low" | "medium" | "high"
+  >("medium");
   const [force, setForce] = useState(false);
-  const [autoTitle, setAutoTitle] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
+  const [autoTitle, setAutoTitle] = useState(true);
   const [message, setMessage] = useState<string | null>(null);
+  /** Historique des envois « Mettre en file » (plusieurs lignes, conservées entre les clics). */
+  const [submitActivityLog, setSubmitActivityLog] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [live, setLive] = useState<StreamPayload | null>(null);
   const [agConnected, setAgConnected] = useState<boolean | null>(null);
@@ -81,13 +112,23 @@ export function HomeDashboard() {
   const refresh = useCallback(async () => {
     try {
       const base = getApiBase();
-      const res = await fetch(`${base}/jobs?limit=40`);
-      if (!res.ok) return;
-      const data = await res.json();
+      const [jobsRes, sumRes] = await Promise.all([
+        fetch(`${base}/jobs?dashboard=true&limit=40`),
+        fetch(`${base}/jobs/summary`),
+      ]);
+      if (!jobsRes.ok) return;
+      const data = await jobsRes.json();
       const jobs = data.jobs as Job[];
-      const counts: Record<string, number> = {};
-      for (const j of jobs) {
-        counts[j.status] = (counts[j.status] ?? 0) + 1;
+      let counts: Record<string, number> = {};
+      if (sumRes.ok) {
+        const s = (await sumRes.json()) as {
+          counts?: Record<string, number>;
+        };
+        counts = s.counts ?? {};
+      } else {
+        for (const j of jobs) {
+          counts[j.status] = (counts[j.status] ?? 0) + 1;
+        }
       }
       setLive({ counts, recent: jobs });
     } catch {
@@ -95,10 +136,57 @@ export function HomeDashboard() {
     }
   }, []);
 
+  const refreshCounts = useCallback(async () => {
+    try {
+      const base = getApiBase();
+      const res = await fetch(`${base}/jobs/summary`);
+      if (!res.ok) return;
+      const data = (await res.json()) as { counts?: Record<string, number> };
+      const counts = data.counts ?? {};
+      setLive((prev) => ({
+        counts,
+        recent: prev?.recent ?? [],
+      }));
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const refreshRef = useRef(refresh);
+  refreshRef.current = refresh;
+  const liveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const onRealtime = useCallback(
+    (msg: GkfyRealtimeMessage) => {
+      if (msg.type === "snapshot") {
+        setLive(msg.data);
+        return;
+      }
+      if (
+        msg.type === "job_created" ||
+        msg.type === "job_updated" ||
+        msg.type === "job_cancelled"
+      ) {
+        const job = msg.data.job;
+        setLive((prev) => ({
+          counts: prev?.counts ?? {},
+          recent: upsertRecentJobs(prev?.recent ?? [], job, LIVE_MERGE_MAX),
+        }));
+        void refreshCounts();
+        if (liveDebounceRef.current) clearTimeout(liveDebounceRef.current);
+        liveDebounceRef.current = setTimeout(() => {
+          liveDebounceRef.current = null;
+          void refreshRef.current();
+        }, 250);
+      }
+    },
+    [refreshCounts],
+  );
+
+  useGkfyRealtime(onRealtime, { onOpen: () => void refresh() });
+
   useEffect(() => {
-    refresh();
-    const t = setInterval(refresh, 4000);
-    return () => clearInterval(t);
+    void refresh();
   }, [refresh]);
 
   const loadPrompts = useCallback(async () => {
@@ -129,6 +217,7 @@ export function HomeDashboard() {
 
   useEffect(() => {
     if (!promptOptions.length) return;
+    if (prompt === AUTO_PROMPT_SENTINEL) return;
     if (!promptOptions.some((p) => p.name === prompt)) {
       const fallback =
         promptOptions.find((p) => p.name === "default") ?? promptOptions[0];
@@ -227,6 +316,10 @@ export function HomeDashboard() {
       setAgEmail(null);
     }
   }, [applyAntigravityStatus]);
+
+  const appendSubmitActivity = useCallback((line: string) => {
+    setSubmitActivityLog((prev) => [...prev, line].slice(-50));
+  }, []);
 
   const disconnectAntigravity = useCallback(async () => {
     setError(null);
@@ -353,41 +446,47 @@ export function HomeDashboard() {
     }
   }, [checkAntigravityAuth]);
 
-  useEffect(() => {
-    const base = getApiBase();
-    const es = new EventSource(`${base}/jobs/stream`);
-    es.onmessage = (ev) => {
-      try {
-        const p = JSON.parse(ev.data) as StreamPayload;
-        setLive(p);
-      } catch {
-        /* ignore */
-      }
-    };
-    es.onerror = () => {
-      es.close();
-    };
-    return () => es.close();
-  }, []);
-
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
     setMessage(null);
-    setSubmitting(true);
+    const urlsSnapshot = urls;
+    if (!urlsSnapshot.trim()) {
+      setError("Collez au moins une URL ou une ligne de texte.");
+      return;
+    }
+    const autoPrompt = prompt === AUTO_PROMPT_SENTINEL;
+    const urlLines = urlsSnapshot
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const refCount = autoPrompt
+      ? Math.min(promptReferenceCount, urlLines.length || 1)
+      : 0;
+    setUrls("");
+    appendSubmitActivity(
+      autoPrompt
+        ? `Génération du prompt (${refCount} référence(s)), puis mise en file…`
+        : "Mise en file…",
+    );
     try {
       const base = getApiBase();
       const payload: Record<string, unknown> = {
-        urls,
+        urls: urlsSnapshot,
         playlist_label: playlistLabel,
         playlist_auto: collectionMode === "auto",
         model,
         thinking_level: thinkingLevel,
         provider,
         force,
-        prompt,
+        prompt: autoPrompt ? "default" : prompt,
         auto_title: autoTitle,
+        auto_generate_prompt: autoPrompt,
       };
+      if (autoPrompt) {
+        payload.prompt_reference_count = promptReferenceCount;
+        payload.prompt_gen_thinking_level = promptGenThinking;
+      }
       if (collectionMode === "auto") {
         if (classifierProvider !== provider) {
           payload.classifier_provider = classifierProvider;
@@ -405,347 +504,567 @@ export function HomeDashboard() {
         const t = await res.text();
         throw new Error(t || res.statusText);
       }
-      const data = await res.json();
-      setMessage(
-        `${data.job_ids?.length ?? 0} job(s) en file — ${data.urls?.length ?? 0} URL(s) valides`,
-      );
-      setUrls("");
-      refresh();
+      const data = (await res.json()) as {
+        job_ids?: string[];
+        urls?: string[];
+        generated_prompt_name?: string | null;
+      };
+      const nJobs = data.job_ids?.length ?? 0;
+      const nUrls = data.urls?.length ?? 0;
+      if (data.generated_prompt_name) {
+        appendSubmitActivity(
+          `${nJobs} job(s) en file — ${nUrls} URL(s) — prompt créé : « ${data.generated_prompt_name} »`,
+        );
+      } else {
+        appendSubmitActivity(
+          `${nJobs} job(s) en file — ${nUrls} URL(s) valides`,
+        );
+      }
+      void refresh();
     } catch (err) {
+      setUrls(urlsSnapshot);
+      setSubmitActivityLog((prev) => prev.slice(0, -1));
       setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSubmitting(false);
     }
   }
 
   const pending =
     (live?.counts?.pending ?? 0) + (live?.counts?.processing ?? 0);
 
+  const showIngestProviderModelInGrid = prompt !== AUTO_PROMPT_SENTINEL;
+
+  const renderAntigravityOAuth = (layout: "fullRow" | "nested") => {
+    if (provider !== "antigravity") return null;
+    const wrapClass =
+      layout === "fullRow"
+        ? "sm:col-span-2 rounded-lg border border-amber-500/30 bg-amber-500/5 dark:bg-amber-500/10 px-4 py-3 flex flex-wrap items-center gap-3"
+        : "mt-2 rounded-lg border border-amber-500/30 bg-amber-500/5 dark:bg-amber-500/10 px-4 py-3 flex flex-wrap items-center gap-3";
+    return (
+      <div className={wrapClass}>
+        {agConnected === null ? (
+          <span className="text-sm text-foreground/60">
+            Vérification de la session Antigravity…
+          </span>
+        ) : agConnected ? (
+          <>
+            <span className="text-sm text-emerald-700 dark:text-emerald-300">
+              Antigravity : connecté
+              {agEmail ? (
+                <>
+                  {" "}
+                  — <span className="font-medium">{agEmail}</span>
+                </>
+              ) : (
+                " (refresh token présent)."
+              )}
+            </span>
+            <button
+              type="button"
+              className="rounded-lg border border-black/15 dark:border-white/15 px-3 py-2 text-sm shrink-0"
+              onClick={() => checkAntigravityAuth()}
+            >
+              Rafraîchir le statut
+            </button>
+            <button
+              type="button"
+              className="rounded-lg border border-red-500/35 text-red-800 dark:text-red-300 px-3 py-2 text-sm shrink-0"
+              onClick={() => void disconnectAntigravity()}
+            >
+              Déconnexion
+            </button>
+          </>
+        ) : (
+          <>
+            <span className="text-sm text-foreground/80">
+              Aucun refresh token pour ce serveur. OAuth web, ou import du compte
+              déjà connecté dans OpenCode (
+              <code className="text-xs">~/.config/opencode/antigravity-accounts.json</code>
+              , même machine que l’API).
+            </span>
+            <button
+              type="button"
+              className="rounded-lg bg-foreground text-background px-3 py-2 text-sm font-medium shrink-0"
+              onClick={() => {
+                window.location.href = `${getApiBase()}/auth/antigravity/login`;
+              }}
+            >
+              Se connecter (Antigravity)
+            </button>
+            {opencodeAccounts.filter((a) => a.has_refresh_token).length > 0 ? (
+              <label className="flex items-center gap-2 text-sm">
+                <span className="text-foreground/70 shrink-0">Compte OpenCode</span>
+                <select
+                  className="rounded-lg border border-black/15 dark:border-white/15 bg-background px-2 py-2 text-sm max-w-[220px]"
+                  value={opencodePick}
+                  onChange={(e) =>
+                    setOpencodePick(Number.parseInt(e.target.value, 10))
+                  }
+                >
+                  {opencodeAccounts
+                    .filter((a) => a.has_refresh_token)
+                    .map((a) => (
+                      <option key={a.index} value={a.index}>
+                        #{a.index}
+                        {a.email ? ` ${a.email}` : ""}
+                        {a.active_for_gemini ? " (actif Antigravity)" : ""}
+                      </option>
+                    ))}
+                </select>
+                <button
+                  type="button"
+                  className="rounded-lg border border-black/15 dark:border-white/15 px-3 py-2 text-sm shrink-0"
+                  onClick={() => void importAntigravityFromOpenCode(opencodePick)}
+                >
+                  Importer ce compte
+                </button>
+              </label>
+            ) : (
+              <button
+                type="button"
+                className="rounded-lg border border-black/15 dark:border-white/15 px-3 py-2 text-sm shrink-0"
+                onClick={() => void importAntigravityFromOpenCode(null)}
+              >
+                Importer OpenCode (auto)
+              </button>
+            )}
+            <button
+              type="button"
+              className="rounded-lg border border-black/15 dark:border-white/15 px-3 py-2 text-sm shrink-0"
+              onClick={() => checkAntigravityAuth()}
+            >
+              Rafraîchir le statut
+            </button>
+          </>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div className="space-y-10">
-      <section className="rounded-xl border border-black/10 dark:border-white/10 p-6 space-y-4">
-        <h2 className="text-lg font-medium">Nouvelles URLs</h2>
-        <p className="text-sm text-foreground/70">
-          Une URL par ligne. Les lignes vides et les commentaires (#) sont
-          ignorés. Même logique de normalisation que le CLI.
-        </p>
-        <form onSubmit={onSubmit} className="space-y-4">
-          <textarea
-            className="w-full min-h-[140px] rounded-lg border border-black/15 dark:border-white/15 bg-background px-3 py-2 text-sm font-mono"
-            placeholder="https://www.youtube.com/watch?v=..."
-            value={urls}
-            onChange={(e) => setUrls(e.target.value)}
-            required
-          />
-          <div className="grid sm:grid-cols-2 gap-4">
-            <div className="sm:col-span-2 space-y-2">
-              <span className="text-sm text-foreground/70">Collection</span>
-              <div className="flex flex-wrap gap-4 text-sm">
-                <label className="flex items-center gap-2 cursor-pointer">
+      <section className="rounded-2xl border border-black/10 dark:border-white/10 bg-gradient-to-b from-background to-black/[0.02] dark:to-white/[0.02] shadow-sm p-6 sm:p-8 space-y-8">
+        <header className="space-y-2 pb-6 border-b border-black/10 dark:border-white/10">
+          <h2 className="text-lg font-semibold tracking-tight text-foreground">
+            Nouvelles URLs
+          </h2>
+          <p className="text-sm text-foreground/65 max-w-2xl leading-relaxed">
+            Une URL par ligne. Les lignes vides et les commentaires (#) sont
+            ignorés. Même logique de normalisation que le CLI.
+          </p>
+        </header>
+        <form onSubmit={onSubmit} className="space-y-8">
+          <div className="space-y-2">
+            <label htmlFor="home-urls" className={`${lbl} block`}>
+              Adresses vidéo
+            </label>
+            <textarea
+              id="home-urls"
+              className={`${ctrlMono} min-h-[168px] max-h-[min(50vh,520px)] resize-y`}
+              placeholder="https://www.youtube.com/watch?v=..."
+              value={urls}
+              onChange={(e) => setUrls(e.target.value)}
+              required
+            />
+            <p className={hint}>
+              Colle une playlist ou un lot d’épisodes ; chaque ligne devient un
+              job d’extraction.
+            </p>
+          </div>
+
+          <div className={`${panel} p-4 sm:p-5 space-y-4`}>
+            <h3 className="text-sm font-semibold text-foreground">
+              Destination / collection
+            </h3>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <label
+                className={`relative flex gap-3 rounded-xl border p-4 cursor-pointer transition-colors ${
+                  collectionMode === "manual"
+                    ? "border-sky-500/40 bg-sky-500/[0.07] dark:bg-sky-400/[0.08] ring-1 ring-sky-500/25"
+                    : "border-black/10 dark:border-white/10 hover:border-black/16 dark:hover:border-white/16"
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="collectionMode"
+                  className="mt-1 size-4 shrink-0 border-black/20 text-sky-600 focus:ring-sky-500/30"
+                  checked={collectionMode === "manual"}
+                  onChange={() => setCollectionMode("manual")}
+                />
+                <div>
+                  <span className={`${lbl} text-foreground`}>Manuel</span>
+                  <p className="mt-1 text-xs text-foreground/55 leading-snug">
+                    Dossier fixe pour toutes les URLs (parent/sous-dossier
+                    possible).
+                  </p>
+                </div>
+              </label>
+              <label
+                className={`relative flex gap-3 rounded-xl border p-4 cursor-pointer transition-colors ${
+                  collectionMode === "auto"
+                    ? "border-sky-500/40 bg-sky-500/[0.07] dark:bg-sky-400/[0.08] ring-1 ring-sky-500/25"
+                    : "border-black/10 dark:border-white/10 hover:border-black/16 dark:hover:border-white/16"
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="collectionMode"
+                  className="mt-1 size-4 shrink-0 border-black/20 text-sky-600 focus:ring-sky-500/30"
+                  checked={collectionMode === "auto"}
+                  onChange={() => setCollectionMode("auto")}
+                />
+                <div>
+                  <span className={`${lbl} text-foreground`}>Automatique</span>
+                  <p className="mt-1 text-xs text-foreground/55 leading-snug">
+                    Le LLM choisit le dossier / sous-dossier pour chaque vidéo.
+                  </p>
+                </div>
+              </label>
+            </div>
+            {collectionMode === "manual" ? (
+              <label className="block space-y-1.5">
+                <span className={lbl}>
+                  Dossier (tu peux utiliser parent/sous-dossier)
+                </span>
+                <input
+                  className={ctrl}
+                  value={playlistLabel}
+                  onChange={(e) => setPlaylistLabel(e.target.value)}
+                />
+              </label>
+            ) : (
+              <div
+                className={`space-y-3 rounded-xl border border-black/8 dark:border-white/10 bg-background/70 dark:bg-background/40 p-4`}
+              >
+                <label className="block space-y-1.5">
+                  <span className={lbl}>
+                    Dossier de secours (si classification impossible)
+                  </span>
                   <input
-                    type="radio"
-                    name="collectionMode"
-                    checked={collectionMode === "manual"}
-                    onChange={() => setCollectionMode("manual")}
-                  />
-                  Manuel (dossier fixe)
-                </label>
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="radio"
-                    name="collectionMode"
-                    checked={collectionMode === "auto"}
-                    onChange={() => setCollectionMode("auto")}
-                  />
-                  Automatique (LLM choisit dossier / sous-dossier)
-                </label>
-              </div>
-              {collectionMode === "manual" ? (
-                <label className="text-sm space-y-1 block">
-                  <span className="text-foreground/70">Dossier (tu peux utiliser parent/sous-dossier)</span>
-                  <input
-                    className="w-full rounded-lg border border-black/15 dark:border-white/15 bg-background px-3 py-2 text-sm"
+                    className={ctrl}
                     value={playlistLabel}
                     onChange={(e) => setPlaylistLabel(e.target.value)}
                   />
                 </label>
-              ) : (
-                <div className="space-y-3 rounded-lg border border-black/10 dark:border-white/10 p-3">
-                  <label className="text-sm space-y-1 block">
-                    <span className="text-foreground/70">
-                      Dossier de secours (si classification impossible)
-                    </span>
-                    <input
-                      className="w-full rounded-lg border border-black/15 dark:border-white/15 bg-background px-3 py-2 text-sm"
-                      value={playlistLabel}
-                      onChange={(e) => setPlaylistLabel(e.target.value)}
-                    />
-                  </label>
-                  <p className="text-xs text-foreground/50">
-                    Consignes globales et thinking : page{" "}
-                    <Link
-                      href="/settings/collections"
-                      className="text-sky-600 dark:text-sky-400 underline"
-                    >
-                      Classement LLM
-                    </Link>
-                    . Ci-dessous : surcharger provider / modèle pour la classification
-                    uniquement (par défaut = même que l’ingest ci-dessous).
-                  </p>
-                  <label className="text-sm space-y-1 block">
-                    <span className="text-foreground/70">Provider (classification)</span>
+                <p className="text-xs text-foreground/50 leading-relaxed">
+                  Consignes globales et thinking : page{" "}
+                  <Link
+                    href="/settings/collections"
+                    className="text-sky-600 dark:text-sky-400 underline font-medium"
+                  >
+                    Classement LLM
+                  </Link>
+                  . Ci-dessous : surcharger provider / modèle pour la classification
+                  uniquement (par défaut = même que l’ingest).
+                </p>
+                <label className="block space-y-1.5">
+                  <span className={lbl}>Provider (classification)</span>
+                  <select
+                    className={ctrl}
+                    value={classifierProvider}
+                    onChange={(e) =>
+                      setClassifierProvider(
+                        e.target.value as "gemini" | "antigravity",
+                      )
+                    }
+                  >
+                    <option value="gemini">gemini (Gemini API + clé)</option>
+                    <option value="antigravity">antigravity (OAuth)</option>
+                  </select>
+                </label>
+                <label className="block space-y-1.5">
+                  <span className={lbl}>Modèle (classification)</span>
+                  <select
+                    className={ctrlMono}
+                    value={classifierModel}
+                    onChange={(e) => setClassifierModel(e.target.value)}
+                  >
+                    {opts[classifierProvider].models.map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                        {m === opts[classifierProvider].default
+                          ? " (défaut)"
+                          : ""}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            )}
+          </div>
+
+          <div className={`${panel} p-4 sm:p-5 space-y-4`}>
+            <div className="space-y-1">
+              <h3 className="text-sm font-semibold text-foreground">
+                Prompt & modèle LLM
+              </h3>
+              <p className="text-xs text-foreground/55 leading-relaxed max-w-2xl">
+                Choix du template et du fournisseur pour l’ingest ; en génération
+                auto du prompt, ce sont les mêmes réglages (thinking ingest en bas
+                de ce bloc).
+              </p>
+            </div>
+            <div className="grid sm:grid-cols-2 gap-4 sm:gap-5">
+              <div
+                className={`text-sm space-y-1 ${prompt === AUTO_PROMPT_SENTINEL ? "sm:col-span-2" : ""}`}
+              >
+                <label htmlFor="home-prompt-select" className={`${lbl} block`}>
+                  Prompt
+                </label>
+                <select
+                  id="home-prompt-select"
+                  className={ctrlMono}
+                  value={prompt}
+                  onChange={(e) => setPrompt(e.target.value)}
+                  onFocus={() => loadPrompts()}
+                >
+                  <option value={AUTO_PROMPT_SENTINEL}>
+                    Génération automatique (2–3 premières URLs = références)
+                  </option>
+                  {promptOptions.length === 0 ? (
+                    <option value="default" disabled>
+                      Chargement du catalogue…
+                    </option>
+                  ) : (
+                    promptOptions.map((p) => (
+                      <option key={p.name} value={p.name}>
+                        {p.name} ({p.source})
+                      </option>
+                    ))
+                  )}
+                </select>
+                <p className={hint}>
+                  Catalogue SQLite + fichiers — rafraîchit au focus.
+                </p>
+                {prompt === AUTO_PROMPT_SENTINEL ? (
+                  <div
+                    className={`mt-3 space-y-3 ${panel} p-4 bg-background/60 dark:bg-background/30`}
+                  >
+                    <p className="text-xs text-foreground/60 leading-relaxed">
+                      Le serveur dérive un nom de fichier, génère le template, l’enregistre
+                      puis enfile un job par URL. <strong>Provider</strong> et{" "}
+                      <strong>modèle</strong> ci‑dessous servent à la fois à la génération du
+                      prompt et à l’ingest. Le « Thinking level » pour l’ingest est en bas de
+                      ce panneau.
+                    </p>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <label className="block space-y-1.5">
+                        <span className={lbl}>Provider</span>
+                        <select
+                          className={ctrl}
+                          value={provider}
+                          onChange={(e) =>
+                            setProvider(e.target.value as "gemini" | "antigravity")
+                          }
+                        >
+                          <option value="gemini">gemini (Gemini API + clé)</option>
+                          <option value="antigravity">antigravity (OAuth)</option>
+                        </select>
+                      </label>
+                      <label className="block space-y-1.5">
+                        <span className={lbl}>
+                          Modèle ({provider})
+                          {provider === "gemini" ? (
+                            <a
+                              href="https://ai.google.dev/gemini-api/docs/models"
+                              target="_blank"
+                              rel="noreferrer"
+                              className="ml-2 text-sky-600 dark:text-sky-400 font-normal"
+                            >
+                              doc
+                            </a>
+                          ) : null}
+                        </span>
+                        <select
+                          className={ctrlMono}
+                          value={model}
+                          onChange={(e) => setModel(e.target.value)}
+                        >
+                          {opts[provider].models.map((m) => (
+                            <option key={m} value={m}>
+                              {m}
+                              {m === opts[provider].default ? " (défaut)" : ""}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                    {renderAntigravityOAuth("nested")}
+                    <label className="block space-y-1.5">
+                      <span className={lbl}>
+                        Vidéos de référence (premières de la liste)
+                      </span>
+                      <select
+                        className={ctrl}
+                        value={promptReferenceCount}
+                        onChange={(e) =>
+                          setPromptReferenceCount(
+                            Number(e.target.value) === 2 ? 2 : 3,
+                          )
+                        }
+                      >
+                        <option value={2}>2</option>
+                        <option value={3}>3</option>
+                      </select>
+                    </label>
+                    <label className="block space-y-1.5">
+                      <span className={lbl}>
+                        Niveau de réflexion (génération du prompt)
+                      </span>
+                      <select
+                        className={ctrl}
+                        value={promptGenThinking}
+                        onChange={(e) =>
+                          setPromptGenThinking(
+                            e.target.value as
+                              | "minimal"
+                              | "low"
+                              | "medium"
+                              | "high",
+                          )
+                        }
+                      >
+                        {(["minimal", "low", "medium", "high"] as const).map(
+                          (lvl) => (
+                            <option key={lvl} value={lvl}>
+                              {lvl}
+                            </option>
+                          ),
+                        )}
+                      </select>
+                    </label>
+                  </div>
+                ) : null}
+              </div>
+              {showIngestProviderModelInGrid ? (
+                <>
+                  <label className="block space-y-1.5">
+                    <span className={lbl}>Provider</span>
                     <select
-                      className="w-full rounded-lg border border-black/15 dark:border-white/15 bg-background px-3 py-2 text-sm"
-                      value={classifierProvider}
+                      className={ctrl}
+                      value={provider}
                       onChange={(e) =>
-                        setClassifierProvider(
-                          e.target.value as "gemini" | "antigravity",
-                        )
+                        setProvider(e.target.value as "gemini" | "antigravity")
                       }
                     >
                       <option value="gemini">gemini (Gemini API + clé)</option>
                       <option value="antigravity">antigravity (OAuth)</option>
                     </select>
                   </label>
-                  <label className="text-sm space-y-1 block">
-                    <span className="text-foreground/70">Modèle (classification)</span>
+                  {renderAntigravityOAuth("fullRow")}
+                  <label className="block space-y-1.5">
+                    <span className={lbl}>
+                      Modèle ({provider})
+                      {provider === "gemini" ? (
+                        <a
+                          href="https://ai.google.dev/gemini-api/docs/models"
+                          target="_blank"
+                          rel="noreferrer"
+                          className="ml-2 text-sky-600 dark:text-sky-400 font-normal"
+                        >
+                          doc Google
+                        </a>
+                      ) : null}
+                    </span>
                     <select
-                      className="w-full rounded-lg border border-black/15 dark:border-white/15 bg-background px-3 py-2 text-sm font-mono"
-                      value={classifierModel}
-                      onChange={(e) => setClassifierModel(e.target.value)}
+                      className={ctrlMono}
+                      value={model}
+                      onChange={(e) => setModel(e.target.value)}
                     >
-                      {opts[classifierProvider].models.map((m) => (
+                      {opts[provider].models.map((m) => (
                         <option key={m} value={m}>
                           {m}
-                          {m === opts[classifierProvider].default ? " (défaut)" : ""}
+                          {m === opts[provider].default ? " (défaut)" : ""}
                         </option>
                       ))}
                     </select>
                   </label>
-                </div>
+                </>
+              ) : (
+                renderAntigravityOAuth("fullRow")
               )}
-            </div>
-            <label className="text-sm space-y-1">
-              <span className="text-foreground/70">Prompt</span>
-              <select
-                className="w-full rounded-lg border border-black/15 dark:border-white/15 bg-background px-3 py-2 text-sm font-mono"
-                value={prompt}
-                onChange={(e) => setPrompt(e.target.value)}
-                onFocus={() => loadPrompts()}
-                disabled={promptOptions.length === 0}
-              >
-                {promptOptions.length === 0 ? (
-                  <option value="default">Chargement…</option>
-                ) : (
-                  promptOptions.map((p) => (
-                    <option key={p.name} value={p.name}>
-                      {p.name} ({p.source})
-                    </option>
-                  ))
-                )}
-              </select>
-              <span className="text-xs text-foreground/50 block mt-1">
-                Liste synchronisée SQLite + fichiers — rafraîchit au focus.
-              </span>
-            </label>
-            <label className="text-sm space-y-1">
-              <span className="text-foreground/70">Provider</span>
-              <select
-                className="w-full rounded-lg border border-black/15 dark:border-white/15 bg-background px-3 py-2 text-sm"
-                value={provider}
-                onChange={(e) =>
-                  setProvider(e.target.value as "gemini" | "antigravity")
+              <label
+                className={
+                  showIngestProviderModelInGrid
+                    ? "block space-y-1.5"
+                    : "block space-y-1.5 sm:col-span-2"
                 }
               >
-                <option value="gemini">gemini (Gemini API + clé)</option>
-                <option value="antigravity">antigravity (OAuth)</option>
-              </select>
-            </label>
-            {provider === "antigravity" ? (
-              <div className="sm:col-span-2 rounded-lg border border-amber-500/30 bg-amber-500/5 dark:bg-amber-500/10 px-4 py-3 flex flex-wrap items-center gap-3">
-                {agConnected === null ? (
-                  <span className="text-sm text-foreground/60">
-                    Vérification de la session Antigravity…
-                  </span>
-                ) : agConnected ? (
-                  <>
-                    <span className="text-sm text-emerald-700 dark:text-emerald-300">
-                      Antigravity : connecté
-                      {agEmail ? (
-                        <>
-                          {" "}
-                          — <span className="font-medium">{agEmail}</span>
-                        </>
-                      ) : (
-                        " (refresh token présent)."
-                      )}
-                    </span>
-                    <button
-                      type="button"
-                      className="rounded-lg border border-black/15 dark:border-white/15 px-3 py-2 text-sm shrink-0"
-                      onClick={() => checkAntigravityAuth()}
-                    >
-                      Rafraîchir le statut
-                    </button>
-                    <button
-                      type="button"
-                      className="rounded-lg border border-red-500/35 text-red-800 dark:text-red-300 px-3 py-2 text-sm shrink-0"
-                      onClick={() => void disconnectAntigravity()}
-                    >
-                      Déconnexion
-                    </button>
-                  </>
-                ) : (
-                  <>
-                    <span className="text-sm text-foreground/80">
-                      Aucun refresh token pour ce serveur. OAuth web, ou import du compte
-                      déjà connecté dans OpenCode (
-                      <code className="text-xs">~/.config/opencode/antigravity-accounts.json</code>
-                      , même machine que l’API).
-                    </span>
-                    <button
-                      type="button"
-                      className="rounded-lg bg-foreground text-background px-3 py-2 text-sm font-medium shrink-0"
-                      onClick={() => {
-                        window.location.href = `${getApiBase()}/auth/antigravity/login`;
-                      }}
-                    >
-                      Se connecter (Antigravity)
-                    </button>
-                    {opencodeAccounts.filter((a) => a.has_refresh_token).length >
-                    0 ? (
-                      <label className="flex items-center gap-2 text-sm">
-                        <span className="text-foreground/70 shrink-0">
-                          Compte OpenCode
-                        </span>
-                        <select
-                          className="rounded-lg border border-black/15 dark:border-white/15 bg-background px-2 py-2 text-sm max-w-[220px]"
-                          value={opencodePick}
-                          onChange={(e) =>
-                            setOpencodePick(Number.parseInt(e.target.value, 10))
-                          }
-                        >
-                          {opencodeAccounts
-                            .filter((a) => a.has_refresh_token)
-                            .map((a) => (
-                              <option key={a.index} value={a.index}>
-                                #{a.index}
-                                {a.email ? ` ${a.email}` : ""}
-                                {a.active_for_gemini ? " (actif Antigravity)" : ""}
-                              </option>
-                            ))}
-                        </select>
-                        <button
-                          type="button"
-                          className="rounded-lg border border-black/15 dark:border-white/15 px-3 py-2 text-sm shrink-0"
-                          onClick={() =>
-                            void importAntigravityFromOpenCode(opencodePick)
-                          }
-                        >
-                          Importer ce compte
-                        </button>
-                      </label>
-                    ) : (
-                      <button
-                        type="button"
-                        className="rounded-lg border border-black/15 dark:border-white/15 px-3 py-2 text-sm shrink-0"
-                        onClick={() => void importAntigravityFromOpenCode(null)}
-                      >
-                        Importer OpenCode (auto)
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      className="rounded-lg border border-black/15 dark:border-white/15 px-3 py-2 text-sm shrink-0"
-                      onClick={() => checkAntigravityAuth()}
-                    >
-                      Rafraîchir le statut
-                    </button>
-                  </>
-                )}
+                <span className={lbl}>Thinking level (ingest)</span>
+                <select
+                  className={ctrl}
+                  value={thinkingLevel}
+                  onChange={(e) => setThinkingLevel(e.target.value)}
+                >
+                  {(["minimal", "low", "medium", "high"] as const).map((l) => (
+                    <option key={l} value={l}>
+                      {l}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-5 pt-2 border-t border-black/10 dark:border-white/10">
+            <div className="flex flex-col-reverse gap-4 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex flex-wrap gap-x-6 gap-y-2 text-sm">
+                <label className="flex items-center gap-2.5 cursor-pointer rounded-lg px-2 py-1.5 -ml-2 hover:bg-black/[0.04] dark:hover:bg-white/[0.05] transition-colors">
+                  <input
+                    type="checkbox"
+                    className="size-4 rounded border-black/20 text-sky-600 focus:ring-sky-500/30"
+                    checked={force}
+                    onChange={(e) => setForce(e.target.checked)}
+                  />
+                  Forcer la régénération
+                </label>
+                <label className="flex items-center gap-2.5 cursor-pointer rounded-lg px-2 py-1.5 -ml-2 hover:bg-black/[0.04] dark:hover:bg-white/[0.05] transition-colors">
+                  <input
+                    type="checkbox"
+                    className="size-4 rounded border-black/20 text-sky-600 focus:ring-sky-500/30"
+                    checked={autoTitle}
+                    onChange={(e) => setAutoTitle(e.target.checked)}
+                  />
+                  Titres YouTube (oEmbed) pour les noms de fichiers
+                </label>
+              </div>
+              <button
+                type="submit"
+                className="shrink-0 rounded-xl bg-foreground text-background px-5 py-2.5 text-sm font-semibold shadow-sm hover:opacity-90 transition-opacity"
+              >
+                Mettre en file
+              </button>
+            </div>
+            {(submitActivityLog.length > 0 || message) ? (
+              <div className="text-sm text-emerald-800 dark:text-emerald-200 rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-3 py-2.5 space-y-2">
+                {submitActivityLog.map((line, i) => (
+                  <p
+                    key={`${i}-${line.slice(0, 48)}`}
+                    className="leading-snug border-b border-emerald-500/15 last:border-b-0 last:pb-0 pb-2"
+                  >
+                    {line}
+                  </p>
+                ))}
+                {message ? (
+                  <p className="leading-snug border-t border-emerald-500/15 pt-2 first:pt-0 first:border-t-0">
+                    {message}
+                  </p>
+                ) : null}
               </div>
             ) : null}
-            <label className="text-sm space-y-1">
-              <span className="text-foreground/70">
-                Modèle ({provider})
-                {provider === "gemini" ? (
-                  <a
-                    href="https://ai.google.dev/gemini-api/docs/models"
-                    target="_blank"
-                    rel="noreferrer"
-                    className="ml-2 text-sky-600 dark:text-sky-400 font-normal"
-                  >
-                    doc Google
-                  </a>
-                ) : null}
-              </span>
-              <select
-                className="w-full rounded-lg border border-black/15 dark:border-white/15 bg-background px-3 py-2 text-sm font-mono"
-                value={model}
-                onChange={(e) => setModel(e.target.value)}
-              >
-                {opts[provider].models.map((m) => (
-                  <option key={m} value={m}>
-                    {m}
-                    {m === opts[provider].default ? " (défaut)" : ""}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="text-sm space-y-1">
-              <span className="text-foreground/70">Thinking level</span>
-              <select
-                className="w-full rounded-lg border border-black/15 dark:border-white/15 bg-background px-3 py-2 text-sm"
-                value={thinkingLevel}
-                onChange={(e) => setThinkingLevel(e.target.value)}
-              >
-                {(["minimal", "low", "medium", "high"] as const).map((l) => (
-                  <option key={l} value={l}>
-                    {l}
-                  </option>
-                ))}
-              </select>
-            </label>
+            {error ? (
+              <p className="text-sm text-red-800 dark:text-red-200 rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2.5">
+                {error}
+              </p>
+            ) : null}
           </div>
-          <div className="flex flex-wrap gap-6 text-sm">
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={force}
-                onChange={(e) => setForce(e.target.checked)}
-              />
-              Forcer la régénération
-            </label>
-            <label className="flex items-center gap-2 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={autoTitle}
-                onChange={(e) => setAutoTitle(e.target.checked)}
-              />
-              Titres YouTube (oEmbed) pour les noms de fichiers
-            </label>
-          </div>
-          <button
-            type="submit"
-            disabled={submitting}
-            className="rounded-lg bg-foreground text-background px-4 py-2 text-sm font-medium disabled:opacity-50"
-          >
-            {submitting ? "Envoi…" : "Mettre en file"}
-          </button>
-          {message && (
-            <p className="text-sm text-emerald-600 dark:text-emerald-400">
-              {message}
-            </p>
-          )}
-          {error && (
-            <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
-          )}
         </form>
       </section>
 
       <section className="space-y-4">
         <div className="flex flex-wrap items-baseline justify-between gap-2">
-          <h2 className="text-lg font-medium">File & activité récente</h2>
+          <h2 className="text-lg font-semibold tracking-tight">
+            File & activité récente
+          </h2>
           {live?.counts && (
             <p className="text-sm text-foreground/70 font-mono">
               En cours: {pending} —{" "}
@@ -755,12 +1074,13 @@ export function HomeDashboard() {
             </p>
           )}
         </div>
-        <div className="rounded-xl border border-black/10 dark:border-white/10 overflow-x-auto">
+        <div className="rounded-xl border border-black/10 dark:border-white/10 bg-background/50 shadow-sm overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-black/10 dark:border-white/10 text-left text-foreground/60">
                 <th className="p-3 font-medium">Statut</th>
                 <th className="p-3 font-medium">URL</th>
+                <th className="p-3 font-medium max-w-[240px]">Activité</th>
                 <th className="p-3 font-medium">Collection</th>
                 <th className="p-3 font-medium">Prompt</th>
                 <th className="p-3 font-medium"></th>
@@ -775,8 +1095,25 @@ export function HomeDashboard() {
                   <td className="p-3">
                     <StatusBadge status={j.status} />
                   </td>
-                  <td className="p-3 max-w-[200px] truncate font-mono text-xs">
-                    {j.url}
+                  <td
+                    className="p-3 max-w-[200px] truncate font-mono text-xs"
+                    title={recentJobUrlSummary(j)}
+                  >
+                    {recentJobUrlSummary(j)}
+                  </td>
+                  <td
+                    className="p-3 max-w-[240px] font-mono text-xs text-foreground/80"
+                    title={j.log_message ?? undefined}
+                  >
+                    {j.log_message ? (
+                      <span className="line-clamp-2 break-words">
+                        {j.log_message.length > JOB_ACTIVITY_TRUNC
+                          ? `${j.log_message.slice(0, JOB_ACTIVITY_TRUNC - 1)}…`
+                          : j.log_message}
+                      </span>
+                    ) : (
+                      "—"
+                    )}
                   </td>
                   <td className="p-3">
                     {j.playlist_label}
@@ -786,12 +1123,21 @@ export function HomeDashboard() {
                   </td>
                   <td className="p-3">{j.prompt_name}</td>
                   <td className="p-3">
-                    <Link
-                      href={`/jobs/${j.id}`}
-                      className="text-sky-600 dark:text-sky-400 hover:underline"
-                    >
-                      Détail
-                    </Link>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Link
+                        href={`/jobs/${j.id}`}
+                        className="text-sky-600 dark:text-sky-400 hover:underline"
+                      >
+                        Détail
+                      </Link>
+                      {j.status === "pending" ? (
+                        <CancelPendingJobButton
+                          jobId={j.id}
+                          onSuccess={refresh}
+                          label="Annuler"
+                        />
+                      ) : null}
+                    </div>
                   </td>
                 </tr>
               ))}

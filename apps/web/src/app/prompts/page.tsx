@@ -1,6 +1,9 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useGkfyRealtime } from "@/lib/useGkfyRealtime";
+import type { ReactNode } from "react";
 import { getApiBase } from "@/lib/api";
 import {
   MODEL_OPTIONS_FALLBACK,
@@ -67,7 +70,7 @@ export default function PromptsPage() {
   const [content, setContent] = useState("");
   const [source, setSource] = useState<string | null>(null);
   const [newName, setNewName] = useState("");
-  const [message, setMessage] = useState<string | null>(null);
+  const [message, setMessage] = useState<ReactNode>(null);
   const [error, setError] = useState<string | null>(null);
 
   const [modelOptions, setModelOptions] = useState<ModelsOptionsResponse | null>(
@@ -83,6 +86,8 @@ export default function PromptsPage() {
   );
   const skipInitialLlmPersist = useRef(true);
   const reconciledModelOptions = useRef(false);
+  /** Last `?prompt=` value we already opened (avoids reload loops when the list refreshes). */
+  const appliedPromptFromUrl = useRef<string | null>(null);
   const [videoType, setVideoType] = useState("");
   const [referenceVideoUrls, setReferenceVideoUrls] = useState("");
   const [extraNotes, setExtraNotes] = useState("");
@@ -107,6 +112,18 @@ export default function PromptsPage() {
       setError(e instanceof Error ? e.message : String(e));
     }
   }, []);
+
+  const loadListRef = useRef(loadList);
+  loadListRef.current = loadList;
+
+  useGkfyRealtime(
+    useCallback((msg) => {
+      if (msg.type === "prompt_saved" || msg.type === "prompt_deleted") {
+        void loadListRef.current();
+      }
+    }, []),
+    { onOpen: () => void loadListRef.current() },
+  );
 
   useEffect(() => {
     loadList();
@@ -294,7 +311,7 @@ export default function PromptsPage() {
     });
   }, [opencodeAccounts]);
 
-  const loadOne = async (name: string) => {
+  const loadOne = useCallback(async (name: string) => {
     setError(null);
     setMessage(null);
     try {
@@ -308,7 +325,26 @@ export default function PromptsPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    if (list.length === 0) return;
+    const wanted =
+      typeof window !== "undefined"
+        ? new URLSearchParams(window.location.search).get("prompt")?.trim()
+        : null;
+    if (!wanted) {
+      appliedPromptFromUrl.current = null;
+      return;
+    }
+    if (appliedPromptFromUrl.current === wanted) return;
+    if (!list.some((p) => p.name === wanted)) {
+      setError(`Prompt « ${wanted} » introuvable dans le catalogue.`);
+      return;
+    }
+    appliedPromptFromUrl.current = wanted;
+    void loadOne(wanted);
+  }, [list, loadOne]);
 
   async function save() {
     if (!selected) return;
@@ -418,6 +454,8 @@ export default function PromptsPage() {
           thinking_level: genThinking,
           extra_notes: extraNotes.trim(),
           video_urls,
+          enqueue: true,
+          save_to_name: selected ?? undefined,
         }),
       });
       if (!res.ok) {
@@ -425,6 +463,27 @@ export default function PromptsPage() {
         throw new Error(t || res.statusText);
       }
       const data = await res.json();
+      if (data.queued && data.job_id) {
+        const jid = String(data.job_id);
+        setMessage(
+          <span>
+            Génération mise en file (même worker que les vidéos) — suivi :{" "}
+            <Link
+              href={`/jobs/${jid}`}
+              className="text-sky-600 dark:text-sky-400 underline font-mono"
+            >
+              {jid}
+            </Link>
+            {" · "}
+            <Link href="/" className="text-sky-600 dark:text-sky-400 underline">
+              file sur l’accueil
+            </Link>
+            .
+          </span>,
+        );
+        return;
+      }
+
       const text = (data.content as string) ?? "";
 
       if (!selected) {
@@ -487,7 +546,9 @@ export default function PromptsPage() {
           YouTube (une par ligne) pour que le LLM s’appuie sur le contenu réel
           et calibre un prompt plus pertinent. Avec Gemini API, chaque URL est
           envoyée en multimodal ; avec Antigravity, seule la première l’est, les
-          autres servent de contexte texte (max. 8 URLs).
+          autres servent de contexte texte (max. 8 URLs). La génération part dans
+          la même file d’attente que les jobs vidéo ; à la fin le prompt est
+          enregistré en base (nom auto ou remplacement du prompt sélectionné).
         </p>
         <div className="grid sm:grid-cols-2 gap-3">
           <label className="text-sm space-y-1">
@@ -686,12 +747,13 @@ export default function PromptsPage() {
           {generating ? "Génération…" : "Générer le prompt"}
         </button>
         <p className="text-xs text-foreground/50">
-          Sans prompt sélectionné : un nom du type{" "}
-          <code className="font-mono text-[11px]">auto-…</code> est créé à partir
-          du type de vidéo, le fichier est enregistré dans{" "}
-          <code className="font-mono text-[11px]">data/prompts</code>. Avec un
-          prompt ouvert : le texte est inséré dans l’éditeur (enregistrement
-          manuel).
+          Sans prompt sélectionné : à la fin du job, un nom{" "}
+          <code className="font-mono text-[11px]">auto-…</code> est attribué et le
+          contenu est enregistré (SQLite +{" "}
+          <code className="font-mono text-[11px]">data/prompts</code> côté API).
+          Avec un prompt ouvert : le même nom est écrasé à la fin du job —
+          rafraîchissez la liste ou rouvrez le prompt une fois le statut{" "}
+          <code className="font-mono text-[11px]">ok</code>.
         </p>
       </section>
 
@@ -765,11 +827,11 @@ export default function PromptsPage() {
               Supprimer copie utilisateur
             </button>
           </div>
-          {message && (
-            <p className="text-sm text-emerald-600 dark:text-emerald-400">
+          {message ? (
+            <div className="text-sm text-emerald-600 dark:text-emerald-400">
               {message}
-            </p>
-          )}
+            </div>
+          ) : null}
           {error && (
             <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
           )}

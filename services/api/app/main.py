@@ -10,11 +10,15 @@ from pathlib import Path
 from typing import Any, List, Literal, Optional, Union
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
+from yt_knowledge_ingest.auto_ingest_prompt import (
+    allocate_prompt_name,
+    build_video_type_from_reference_urls,
+)
 from yt_knowledge_ingest.gemini_client import DEFAULT_MODEL, THINKING_LEVELS, make_client_or_none
 from yt_knowledge_ingest.prompt_generator import generate_prompt_markdown
 from yt_knowledge_ingest.model_options import (
@@ -43,20 +47,25 @@ from .db import (
     artifact_tree_from_db,
     fetch_prompts_catalog,
     get_analysis_markdown_by_rel,
+    cancel_pending_job,
     get_job,
+    get_latest_job_by_output_rel,
     init_db,
     insert_job,
+    insert_prompt_generate_job,
     iter_zip_analysis_rows,
     job_counts,
     kv_get,
     kv_set,
     list_jobs,
+    list_jobs_dashboard_view,
     sync_prompts_catalog,
     user_prompt_delete,
     user_prompt_get,
     user_prompt_upsert,
 )
 from .repo_export import mirror_markdown
+from . import realtime
 from .worker import pool, resolve_provider_client
 
 COLLECTION_CLASSIFIER_SETTINGS_KEY = "collection_classifier_settings"
@@ -86,6 +95,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def _startup_realtime_loop() -> None:
+    realtime.bind_event_loop(asyncio.get_running_loop())
 
 
 @app.on_event("startup")
@@ -242,11 +256,20 @@ class EnqueueRequest(BaseModel):
     force: bool = False
     prompt: str = "default"
     auto_title: bool = False
+    auto_generate_prompt: bool = False
+    prompt_reference_count: int = Field(
+        3,
+        ge=1,
+        le=3,
+        description="First N URLs used as multimodal references for template generation",
+    )
+    prompt_gen_thinking_level: Literal["minimal", "low", "medium", "high"] = "medium"
 
 
 class EnqueueResponse(BaseModel):
     job_ids: list[str]
     urls: list[str]
+    generated_prompt_name: Optional[str] = None
 
 
 @app.post("/jobs", response_model=EnqueueResponse)
@@ -295,6 +318,64 @@ def create_jobs(body: EnqueueRequest) -> EnqueueResponse:
         if body.classifier_provider is not None:
             cp_override = body.classifier_provider
 
+    generated_prompt_name: Optional[str] = None
+    prompt_for_jobs = body.prompt
+    if body.auto_generate_prompt:
+        k = max(1, min(body.prompt_reference_count, len(urls)))
+        ref_urls = urls[:k]
+        video_type = build_video_type_from_reference_urls(ref_urls)
+        if body.provider == "gemini" and make_client_or_none() is None:
+            raise HTTPException(
+                status_code=503,
+                detail="GEMINI_API_KEY is not set",
+            )
+        try:
+            client = resolve_provider_client(body.provider)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        tl_gen = body.prompt_gen_thinking_level
+        if tl_gen not in THINKING_LEVELS:
+            tl_gen = "medium"
+        try:
+            prompt_markdown = generate_prompt_markdown(
+                client=client,
+                provider=body.provider,
+                model=resolved_model,
+                video_type=video_type,
+                thinking_level=tl_gen,
+                extra_notes="",
+                video_urls=ref_urls,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"{type(exc).__name__}: {exc}",
+            ) from exc
+
+        sync_prompts_catalog(BUILTIN_PROMPTS_DIR, USER_PROMPTS_DIR)
+        existing = {n for n, _ in fetch_prompts_catalog()}
+        new_prompt_name = allocate_prompt_name(video_type, existing)
+        user_prompt_upsert(new_prompt_name, prompt_markdown)
+        sync_prompts_catalog(BUILTIN_PROMPTS_DIR, USER_PROMPTS_DIR)
+        realtime.emit_prompt_saved(new_prompt_name, "user")
+        if REPO_EXPORT_DIR is not None:
+            try:
+                mirror_markdown(
+                    REPO_EXPORT_DIR,
+                    f"prompts/{new_prompt_name}.md",
+                    prompt_markdown,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Repo mirror failed for prompt %s: %s",
+                    new_prompt_name,
+                    exc,
+                )
+        prompt_for_jobs = new_prompt_name
+        generated_prompt_name = new_prompt_name
+
     job_ids: list[str] = []
     for url in urls:
         jid = insert_job(
@@ -304,7 +385,7 @@ def create_jobs(body: EnqueueRequest) -> EnqueueResponse:
             thinking_level=body.thinking_level,
             provider=body.provider,
             force=body.force,
-            prompt_name=body.prompt,
+            prompt_name=prompt_for_jobs,
             auto_title=body.auto_title,
             playlist_auto=body.playlist_auto,
             classifier_provider=cp_override if body.playlist_auto else None,
@@ -312,15 +393,26 @@ def create_jobs(body: EnqueueRequest) -> EnqueueResponse:
         )
         job_ids.append(jid)
         pool.enqueue(jid)
-    return EnqueueResponse(job_ids=job_ids, urls=urls)
+    return EnqueueResponse(
+        job_ids=job_ids,
+        urls=urls,
+        generated_prompt_name=generated_prompt_name,
+    )
 
 
 @app.get("/jobs")
 def get_jobs(
     limit: int = Query(200, ge=1, le=1000),
     status: Optional[str] = None,
+    dashboard: bool = Query(
+        False,
+        description="If true, return queued pending jobs plus the most recent others (limit = recent slice).",
+    ),
 ) -> dict[str, Any]:
-    rows = list_jobs(limit=limit, status=status)
+    if dashboard:
+        rows = list_jobs_dashboard_view(recent_limit=min(limit, 100))
+    else:
+        rows = list_jobs(limit=limit, status=status)
     return {"jobs": [r.to_dict() for r in rows]}
 
 
@@ -328,6 +420,18 @@ def get_jobs(
 def jobs_summary() -> dict[str, Any]:
     counts = job_counts()
     return {"counts": counts}
+
+
+@app.get("/jobs/by-output")
+def get_job_by_output(rel: str = Query(..., min_length=1)) -> dict[str, Any]:
+    """Resolve the latest job metadata for an analysis path (under ``data/output``)."""
+    _safe_output_rel(rel)
+    row = get_latest_job_by_output_rel(rel)
+    if row is None:
+        raise HTTPException(
+            status_code=404, detail="No job found for this output path"
+        )
+    return row.to_dict()
 
 
 @app.get("/jobs/{job_id}")
@@ -338,18 +442,42 @@ def get_job_detail(job_id: str) -> dict[str, Any]:
     return row.to_dict(include_analysis=True)
 
 
+@app.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str) -> dict[str, Any]:
+    """Remove a pending job from the queue (in-memory worker will no-op when it runs)."""
+    if cancel_pending_job(job_id):
+        row = get_job(job_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return row.to_dict()
+    row = get_job(job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    raise HTTPException(
+        status_code=409,
+        detail=f"Job cannot be cancelled (status: {row.status})",
+    )
+
+
 @app.get("/jobs/stream")
 async def jobs_stream() -> StreamingResponse:
     async def gen():
         while True:
             payload = {
                 "counts": job_counts(),
-                "recent": [j.to_dict() for j in list_jobs(limit=30)],
+                "recent": [
+                    j.to_dict() for j in list_jobs_dashboard_view(recent_limit=30)
+                ],
             }
             yield f"data: {json.dumps(payload)}\n\n"
             await asyncio.sleep(2)
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.websocket("/ws")
+async def websocket_live(ws: WebSocket) -> None:
+    await realtime.handle_websocket(ws)
 
 
 @app.get("/prompts")
@@ -371,6 +499,15 @@ class PromptGenerateBody(BaseModel):
         default_factory=list,
         description="Optional YouTube URLs (one multimodal signal per provider rules)",
     )
+    enqueue: bool = Field(
+        False,
+        description="If true, run via the same worker queue as video jobs.",
+    )
+    save_to_name: Optional[str] = Field(
+        None,
+        max_length=200,
+        description="If set, persist under this user prompt name when the job completes.",
+    )
 
     @field_validator("video_urls")
     @classmethod
@@ -379,9 +516,19 @@ class PromptGenerateBody(BaseModel):
             raise ValueError("At most 8 entries in video_urls")
         return v
 
+    @field_validator("save_to_name")
+    @classmethod
+    def _safe_save_name(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or not str(v).strip():
+            return None
+        s = str(v).strip()
+        if "/" in s or ".." in s or not s:
+            raise ValueError("Invalid save_to_name")
+        return s
+
 
 @app.post("/prompts/generate")
-def prompts_generate(body: PromptGenerateBody) -> dict[str, str]:
+def prompts_generate(body: PromptGenerateBody) -> dict[str, Any]:
     """Generate a prompt template (.md) via LLM from a video type description."""
     allowed = set(models_for_provider(body.provider))
     model = (body.model or "").strip()
@@ -398,11 +545,28 @@ def prompts_generate(body: PromptGenerateBody) -> dict[str, str]:
         )
 
     try:
-        client = resolve_provider_client(body.provider)
+        resolve_provider_client(body.provider)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
+    if body.enqueue:
+        payload = {
+            "video_type": body.video_type,
+            "extra_notes": body.extra_notes,
+            "video_urls": body.video_urls,
+            "save_to_name": body.save_to_name,
+        }
+        jid = insert_prompt_generate_job(
+            model=model,
+            thinking_level=tl,
+            provider=body.provider,
+            payload=payload,
+        )
+        pool.enqueue(jid)
+        return {"job_id": jid, "queued": True}
+
     try:
+        client = resolve_provider_client(body.provider)
         content = generate_prompt_markdown(
             client=client,
             provider=body.provider,
@@ -420,7 +584,7 @@ def prompts_generate(body: PromptGenerateBody) -> dict[str, str]:
             detail=f"{type(exc).__name__}: {exc}",
         ) from exc
 
-    return {"content": content}
+    return {"content": content, "queued": False}
 
 
 @app.get("/prompts/{name}")
@@ -463,6 +627,7 @@ def prompt_put(name: str, body: PromptPut) -> dict[str, str]:
             mirror_markdown(REPO_EXPORT_DIR, f"prompts/{name}.md", body.content)
         except Exception as exc:
             logger.warning("Repo mirror failed for prompt %s: %s", name, exc)
+    realtime.emit_prompt_saved(name, "user")
     return {"name": name, "source": "user", "content": body.content}
 
 
@@ -478,6 +643,7 @@ def prompt_delete(name: str) -> dict[str, bool]:
     if had_file:
         path.unlink()
     sync_prompts_catalog(BUILTIN_PROMPTS_DIR, USER_PROMPTS_DIR)
+    realtime.emit_prompt_deleted(name)
     return {"deleted": True}
 
 

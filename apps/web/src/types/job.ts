@@ -1,9 +1,19 @@
 export type JobStatus =
   | "pending"
   | "processing"
+  | "cancelled"
   | "ok"
   | "error"
   | "skipped";
+
+export type JobKind = "video" | "prompt_generate";
+
+export interface PromptGenerateJobPayload {
+  video_type?: string;
+  extra_notes?: string;
+  video_urls?: string[];
+  save_to_name?: string | null;
+}
 
 export interface Job {
   id: string;
@@ -23,6 +33,8 @@ export interface Job {
   output_rel_path: string | null;
   error_message: string | null;
   log_message: string | null;
+  job_kind?: JobKind;
+  payload?: PromptGenerateJobPayload | null;
   created_at: string;
   updated_at: string;
 }

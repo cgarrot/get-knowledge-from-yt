@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from yt_knowledge_ingest.prompt_generator import (
     _MAX_REFERENCE_VIDEOS,
+    _PROMPT_ENGINEER_SYSTEM,
     _normalize_generated_prompt_markdown,
     generate_prompt_markdown,
     normalize_reference_video_urls,
@@ -53,6 +54,13 @@ def test_normalize_generated_prompt_markdown_rejects_empty_body():
         assert "empty" in str(e).lower()
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_prompt_engineer_system_pushes_information_dense_outputs():
+    text = _PROMPT_ENGINEER_SYSTEM.lower()
+    assert "detail density & coverage" in text
+    assert "concise only in the tl;dr" in text
+    assert "records multiple concrete examples" in text
 
 
 def test_generate_prompt_markdown_validates_empty_video_type():

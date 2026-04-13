@@ -1,4 +1,4 @@
-import { ContentView } from "./content-view";
+import { redirect } from "next/navigation";
 
 function firstParam(
   v: string | string[] | undefined,
@@ -15,10 +15,16 @@ export default async function ContentPage({
   const sp = await searchParams;
   const rel = firstParam(sp.rel);
 
-  return (
-    <div className="space-y-4">
-      <h1 className="text-2xl font-semibold tracking-tight">Contenu</h1>
-      <ContentView rel={rel} />
-    </div>
-  );
+  if (!rel) {
+    return (
+      <div className="space-y-4">
+        <h1 className="text-2xl font-semibold tracking-tight">Contenu</h1>
+        <p className="text-foreground/70">
+          Paramètre <code className="font-mono text-sm">rel</code> manquant.
+        </p>
+      </div>
+    );
+  }
+
+  redirect(`/library?rel=${encodeURIComponent(rel)}`);
 }

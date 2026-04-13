@@ -3,11 +3,7 @@
 import { useEffect, useState } from "react";
 import { getApiBase } from "@/lib/api";
 import { MarkdownBody } from "@/components/MarkdownBody";
-
-function stripFrontmatter(md: string): string {
-  const m = md.match(/^---\s*\n[\s\S]*?\n---\s*\n([\s\S]*)$/);
-  return m ? m[1].trim() : md;
-}
+import { stripFrontmatter } from "@/lib/markdown";
 
 export function JobDetailClient({
   relPath,
@@ -25,7 +21,11 @@ export function JobDetailClient({
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
-    if (initialMarkdown) return;
+    if (initialMarkdown) {
+      setBody(stripFrontmatter(initialMarkdown));
+      setErr(null);
+      return;
+    }
     let cancelled = false;
     (async () => {
       try {

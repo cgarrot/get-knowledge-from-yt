@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import uuid
@@ -31,6 +32,12 @@ def _migrate_jobs(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE jobs ADD COLUMN classifier_model TEXT")
     if "analysis_markdown" not in cols:
         conn.execute("ALTER TABLE jobs ADD COLUMN analysis_markdown TEXT")
+    if "job_kind" not in cols:
+        conn.execute(
+            "ALTER TABLE jobs ADD COLUMN job_kind TEXT NOT NULL DEFAULT 'video'"
+        )
+    if "payload_json" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN payload_json TEXT")
 
 
 def init_db() -> None:
@@ -201,6 +208,8 @@ class JobRow:
     output_rel_path: Optional[str]
     error_message: Optional[str]
     log_message: Optional[str]
+    job_kind: str
+    payload_json: Optional[str]
     created_at: str
     updated_at: str
 
@@ -233,6 +242,14 @@ class JobRow:
             output_rel_path=row["output_rel_path"],
             error_message=row["error_message"],
             log_message=row["log_message"],
+            job_kind=(
+                str(row["job_kind"]) if "job_kind" in keys else "video"
+            ),
+            payload_json=(
+                str(row["payload_json"])
+                if "payload_json" in keys and row["payload_json"] is not None
+                else None
+            ),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -256,9 +273,17 @@ class JobRow:
             "output_rel_path": self.output_rel_path,
             "error_message": self.error_message,
             "log_message": self.log_message,
+            "job_kind": self.job_kind,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+        if self.payload_json:
+            try:
+                d["payload"] = json.loads(self.payload_json)
+            except json.JSONDecodeError:
+                d["payload"] = None
+        else:
+            d["payload"] = None
         if include_analysis:
             d["analysis_markdown"] = self.analysis_markdown
         return d
@@ -286,9 +311,9 @@ def insert_job(
             INSERT INTO jobs (
               id, url, playlist_label, status, model, thinking_level, provider,
               force_ingest, prompt_name, auto_title, playlist_auto,
-              classifier_provider, classifier_model, output_rel_path,
-              error_message, log_message, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
+              classifier_provider, classifier_model, job_kind, payload_json,
+              output_rel_path, error_message, log_message, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'video', NULL, NULL, NULL, NULL, ?, ?)
             """,
             (
                 job_id,
@@ -309,7 +334,88 @@ def insert_job(
             ),
         )
         conn.commit()
+    try:
+        from . import realtime
+
+        realtime.emit_job_created(job_id)
+    except Exception:  # noqa: BLE001
+        pass
     return job_id
+
+
+PROMPT_GENERATE_JOB_URL = "gkfy:prompt-generate"
+PROMPT_GENERATE_JOB_PROMPT_NAME = "_prompt_generate_"
+
+
+def insert_prompt_generate_job(
+    *,
+    model: str,
+    thinking_level: str,
+    provider: str,
+    payload: dict[str, Any],
+) -> str:
+    """Queue LLM prompt-template generation (same worker pool as video jobs)."""
+    job_id = str(uuid.uuid4())
+    now = _utc_now()
+    payload_s = json.dumps(payload, ensure_ascii=False)
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs (
+              id, url, playlist_label, status, model, thinking_level, provider,
+              force_ingest, prompt_name, auto_title, playlist_auto,
+              classifier_provider, classifier_model, job_kind, payload_json,
+              output_rel_path, error_message, log_message, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 0, 0, NULL, NULL, 'prompt_generate', ?, NULL, NULL, NULL, ?, ?)
+            """,
+            (
+                job_id,
+                PROMPT_GENERATE_JOB_URL,
+                "prompts",
+                "pending",
+                model,
+                thinking_level,
+                provider,
+                PROMPT_GENERATE_JOB_PROMPT_NAME,
+                payload_s,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+    try:
+        from . import realtime
+
+        realtime.emit_job_created(job_id)
+    except Exception:  # noqa: BLE001
+        pass
+    return job_id
+
+
+def cancel_pending_job(job_id: str) -> bool:
+    """Mark a job as cancelled if it is still pending. Returns True if a row was updated."""
+    now = _utc_now()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            UPDATE jobs
+            SET status = 'cancelled',
+                log_message = 'cancelled (removed from queue)',
+                updated_at = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (now, job_id),
+        )
+        conn.commit()
+        ok = cur.rowcount > 0
+    if ok:
+        try:
+            from . import realtime
+
+            realtime.emit_job_cancelled(job_id)
+        except Exception:  # noqa: BLE001
+            pass
+    return ok
 
 
 def update_job(
@@ -344,6 +450,7 @@ def update_job(
         values.append(analysis_markdown)
     if not fields:
         return
+    artifact_touched = output_rel_path is not None or analysis_markdown is not None
     fields.append("updated_at = ?")
     values.append(_utc_now())
     values.append(job_id)
@@ -353,11 +460,33 @@ def update_job(
             values,
         )
         conn.commit()
+    try:
+        from . import realtime
+
+        realtime.emit_job_updated(job_id, artifact_touched=artifact_touched)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def get_job(job_id: str) -> Optional[JobRow]:
     with get_conn() as conn:
         cur = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
+        row = cur.fetchone()
+        return JobRow.from_row(row) if row else None
+
+
+def get_latest_job_by_output_rel(output_rel_path: str) -> Optional[JobRow]:
+    """Most recently updated job for this output path (e.g. ``playlist/slug.md``)."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            SELECT * FROM jobs
+            WHERE output_rel_path = ?
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (output_rel_path,),
+        )
         row = cur.fetchone()
         return JobRow.from_row(row) if row else None
 
@@ -377,6 +506,20 @@ def list_jobs(
     with get_conn() as conn:
         cur = conn.execute(q, args)
         return [JobRow.from_row(r) for r in cur.fetchall()]
+
+
+def list_jobs_dashboard_view(
+    *,
+    recent_limit: int = 40,
+    pending_limit: int = 500,
+) -> list[JobRow]:
+    """Pending jobs (queue) plus recent activity; pending first FIFO, then newest non-pending."""
+    pending_rows = list_jobs(limit=pending_limit, status="pending")
+    pending_sorted = sorted(pending_rows, key=lambda r: r.created_at)
+    seen = {r.id for r in pending_sorted}
+    recent_rows = list_jobs(limit=recent_limit)
+    tail = [r for r in recent_rows if r.id not in seen]
+    return list(pending_sorted) + tail
 
 
 def list_pending_job_ids() -> list[str]:

@@ -22,6 +22,13 @@ export function getServerApiBase(): string {
   return normalizeApiBase(raw);
 }
 
+/** WebSocket base derived from the browser API URL (http→ws, https→wss). */
+export function getWsApiBase(): string {
+  const base = getApiBase();
+  if (base.startsWith("https://")) return base.replace(/^https/, "wss");
+  return base.replace(/^http/, "ws");
+}
+
 export async function apiFetch<T>(
   path: string,
   init?: RequestInit,

@@ -66,18 +66,27 @@ export function JobPageClient({ initialJob }: { initialJob: Job }) {
         </h1>
       </div>
 
-      <dl className="grid sm:grid-cols-2 gap-3 text-sm border border-black/10 dark:border-white/10 rounded-xl p-4">
+      <div className="rounded-xl border border-black/10 dark:border-white/10 overflow-hidden">
+        {job.status === "error" ? (
+          <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 bg-red-500/5 dark:bg-red-500/10 border-b border-black/10 dark:border-white/10">
+            <p className="text-sm text-foreground/80">
+              Ce job a échoué. Remettez-le en file pour relancer le traitement avec les
+              mêmes paramètres.
+            </p>
+            <RetryFailedJobButton
+              jobId={job.id}
+              onSuccess={() => void resyncFromApi()}
+              className="shrink-0 !px-3 !py-1.5 text-sm font-semibold bg-foreground text-background hover:bg-foreground/90 dark:hover:bg-foreground/90 border-transparent"
+              label="Relancer"
+            />
+          </div>
+        ) : null}
+        <dl className="grid sm:grid-cols-2 gap-3 text-sm p-4">
         <dt className="text-foreground/60">Statut</dt>
-        <dd className="space-y-2">
+        <dd className="flex flex-wrap items-center gap-2">
           <StatusBadge status={job.status} />
           {job.status === "pending" ? (
             <CancelPendingJobButton
-              jobId={job.id}
-              onSuccess={() => void resyncFromApi()}
-            />
-          ) : null}
-          {job.status === "error" ? (
-            <RetryFailedJobButton
               jobId={job.id}
               onSuccess={() => void resyncFromApi()}
             />
@@ -176,7 +185,8 @@ export function JobPageClient({ initialJob }: { initialJob: Job }) {
             </dd>
           </>
         )}
-      </dl>
+        </dl>
+      </div>
 
       {isPromptJob && job.analysis_markdown && promptStem ? (
         <section className="space-y-3">
